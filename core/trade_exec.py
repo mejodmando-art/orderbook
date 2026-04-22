@@ -245,8 +245,13 @@ async def get_order(symbol: str, order_id: str) -> dict:
 
 class VirtualStopLossWatcher:
     """
-    Monitors live price and triggers an emergency market sell when
-    price drops to entry_price * stop_loss_pct.
+    Monitors live price and triggers an emergency market sell when price
+    drops to or below stop_loss_price.
+
+    Accepts either an absolute stop_loss_price or a stop_loss_pct ratio
+    (stop_loss_price = entry_price * stop_loss_pct).  Prefer passing the
+    absolute price directly to avoid floating-point drift from ratio
+    round-trips.
 
     State is persisted to Supabase (via db_manager) on trigger so the
     closed status survives a restart.
@@ -264,15 +269,21 @@ class VirtualStopLossWatcher:
         entry_price: float,
         qty: float,
         exit_order_id: str | None,
-        stop_loss_pct: float,
         notifier: TelegramNotifier,
+        stop_loss_price: float | None = None,
+        stop_loss_pct: float = 0.985,
         on_triggered: Callable[[], Coroutine[Any, Any, None]] | None = None,
     ) -> None:
         self.symbol = symbol
         self.entry_price = entry_price
         self.qty = qty
         self.exit_order_id = exit_order_id
-        self.stop_loss_price = round(entry_price * stop_loss_pct, 8)
+        # Absolute price takes precedence; ratio is the fallback.
+        self.stop_loss_price = (
+            stop_loss_price
+            if stop_loss_price is not None
+            else round(entry_price * stop_loss_pct, 8)
+        )
         self.notifier = notifier
         self.on_triggered = on_triggered
 
@@ -281,9 +292,10 @@ class VirtualStopLossWatcher:
         self._cancelled = False
         self._triggered = False
 
+        pct_display = (1.0 - self.stop_loss_price / entry_price) * 100 if entry_price else 0.0
         logger.info(
             "VirtualSL armed: entry=%.8f sl=%.8f (%.1f%%) qty=%.8f",
-            entry_price, self.stop_loss_price, (1 - stop_loss_pct) * 100, qty,
+            entry_price, self.stop_loss_price, pct_display, qty,
         )
 
     def update_price(self, price: float) -> None:
@@ -385,10 +397,15 @@ async def poll_order_fill(
     on_filled: Callable[[dict], Coroutine[Any, Any, None]],
     poll_interval: float = 2.0,
     timeout: float = 3600.0,
+    on_timeout: Callable[[], Coroutine[Any, Any, None]] | None = None,
 ) -> None:
     """
     Poll an order's status every poll_interval seconds until FILLED or timeout.
+
     Calls on_filled(order_data) when status becomes "FILLED".
+    Calls on_timeout() when the deadline is reached without a fill — the
+    caller is responsible for cancelling the order and resetting state.
+    If on_timeout is None, a warning is logged and the function returns.
     """
     deadline = time.time() + timeout
     logger.info("Polling fill for order %s on %s", order_id, symbol)
@@ -414,3 +431,8 @@ async def poll_order_fill(
         await asyncio.sleep(poll_interval)
 
     logger.warning("Order %s poll timed out after %.0fs", order_id, timeout)
+    if on_timeout:
+        try:
+            await on_timeout()
+        except Exception as exc:
+            logger.error("on_timeout callback error for order %s: %s", order_id, exc)
