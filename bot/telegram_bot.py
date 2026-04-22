@@ -9,6 +9,7 @@ Public functions used by main.py:
 import asyncio
 import logging
 import time
+from collections.abc import Callable, Coroutine
 from typing import TYPE_CHECKING
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -297,7 +298,9 @@ async def _on_depth(msg: dict) -> None:
 def _start_ws(symbol: str) -> None:
     """Subscribe to WS streams and start the connection task if not running."""
     _state.ws.subscribe(f"spot@public.miniTicker.v3.api@{symbol}", _on_ticker)
-    _state.ws.subscribe(f"spot@public.increase.depth.v3.api@{symbol}@5", _on_depth)
+    # @20 gives a deeper initial snapshot and richer delta coverage for OB
+    # volume confirmation.  update_depth() applies deltas incrementally.
+    _state.ws.subscribe(f"spot@public.increase.depth.v3.api@{symbol}@20", _on_depth)
     if _state.ws_task is None or _state.ws_task.done():
         _state.ws_task = asyncio.create_task(_state.ws.run())
         logger.info("WebSocket task started for %s", symbol)
@@ -308,9 +311,17 @@ def _arm_sl_watcher(
     entry_price: float,
     entry_qty: float,
     exit_order_id: str | None,
-    sl_pct: float,
     application: Application,
+    sl_price: float | None = None,
+    sl_pct: float = 0.985,
 ) -> None:
+    """
+    Arm the VirtualStopLossWatcher.
+
+    Prefer passing sl_price (absolute) — it is used directly without any
+    ratio round-trip.  sl_pct is the fallback when sl_price is not available
+    (e.g. legacy recovery paths).
+    """
     async def _notifier(text: str) -> None:
         await send_alert(text, application)
 
@@ -323,15 +334,16 @@ def _arm_sl_watcher(
         entry_price=entry_price,
         qty=entry_qty,
         exit_order_id=exit_order_id,
-        stop_loss_pct=sl_pct,
         notifier=_notifier,
+        stop_loss_price=sl_price,
+        stop_loss_pct=sl_pct,
         on_triggered=_on_sl_triggered,
     )
     _state.sl_watcher = watcher
     _state.sl_task = asyncio.create_task(watcher.run())
     logger.info(
         "Virtual SL watcher armed: entry=%.8f sl=%.8f",
-        entry_price, entry_price * sl_pct,
+        entry_price, watcher.stop_loss_price,
     )
 
 
@@ -349,7 +361,7 @@ async def _monitor_loop(application: Application) -> None:
             trade_status = cfg.get("trade_status", "idle")
             symbol = (row.get("symbol") if row else None) or _state.config.get("symbol", "—")
 
-            current_price = _state.analyzer._current_price
+            current_price = _state.analyzer.current_price
             sma = _state.analyzer.sma()
 
             if trade_status == "searching":
@@ -445,10 +457,68 @@ async def _on_order_filled(order: dict, application: Application) -> None:
         application,
     )
 
-    # VirtualStopLossWatcher expects stop_loss_pct as a ratio (e.g. 0.985).
-    # Derive it from the absolute OB-based sl_price.
-    sl_ratio = sl_price / entry_price if entry_price else 0.985
-    _arm_sl_watcher(symbol, entry_price, entry_qty, exit_order_id, sl_ratio, application)
+    _arm_sl_watcher(
+        symbol=symbol,
+        entry_price=entry_price,
+        entry_qty=entry_qty,
+        exit_order_id=exit_order_id,
+        application=application,
+        sl_price=sl_price,
+    )
+
+
+def _make_fill_timeout_cb(
+    symbol: str,
+    order_id: str,
+    application: Application,
+) -> Callable[[], Coroutine]:
+    """
+    Return an async callback that handles a fill-poll timeout:
+    1. Attempt to cancel the open limit order on MEXC.
+    2. Reset Supabase state to idle.
+    3. Reset in-memory bot state.
+    4. Send a Telegram alert.
+
+    Passed as on_timeout= to trade_exec.poll_order_fill so that a timed-out
+    order never leaves the bot stuck in pending_fill indefinitely.
+    """
+    async def _on_timeout() -> None:
+        logger.warning(
+            "Fill poll timed out for order %s on %s — cancelling and resetting",
+            order_id, symbol,
+        )
+        # 1. Cancel the limit order (best-effort)
+        try:
+            await trade_exec.cancel_order(symbol, order_id)
+            logger.info("Timed-out order %s cancelled", order_id)
+        except Exception as exc:
+            logger.error("Failed to cancel timed-out order %s: %s", order_id, exc)
+
+        # 2. Reset DB state
+        try:
+            await get_db().reset_state()
+        except Exception as exc:
+            logger.error("Failed to reset DB after fill timeout: %s", exc)
+
+        # 3. Reset in-memory state
+        _state.running = False
+        _state.fill_poll_task = None
+        if _state.ws_task and not _state.ws_task.done():
+            _state.ws_task.cancel()
+        _state.ws = MexcWebSocket()
+        _state.analyzer.reset()
+        _state.config = {}
+
+        # 4. Alert
+        await send_alert(
+            f"⚠️ *Limit order timed out — cancelled.*\n\n"
+            f"Symbol: `{symbol}`\n"
+            f"Order ID: `{order_id}`\n\n"
+            "Bot is now idle. Use /start to configure a new trade.",
+            application,
+        )
+
+    return _on_timeout
 
 
 async def _start_strategy(application: Application) -> None:
@@ -493,7 +563,7 @@ async def _start_strategy(application: Application) -> None:
                 logger.info(
                     "OBs refreshed for %s [%s]: %d bullish, %d bearish",
                     symbol, timeframe,
-                    len(_state.analyzer._bullish_obs),
+                    len(_state.analyzer._bullish_obs),  # internal list, read-only
                     len(_state.analyzer._bearish_obs),
                 )
             except Exception as exc:
@@ -506,7 +576,7 @@ async def _start_strategy(application: Application) -> None:
         attempt += 1
         if attempt % 12 == 0:  # log every ~60s
             sma = _state.analyzer.sma()
-            price = _state.analyzer._current_price
+            price = _state.analyzer.current_price
             logger.info(
                 "Searching for OB entry signal (attempt %d) price=%.8f sma=%s",
                 attempt, price, f"{sma:.8f}" if sma else "warming",
@@ -579,7 +649,10 @@ async def _start_strategy(application: Application) -> None:
         await _on_order_filled(order, application)
 
     _state.fill_poll_task = asyncio.create_task(
-        trade_exec.poll_order_fill(symbol, order_id, _filled_cb)
+        trade_exec.poll_order_fill(
+            symbol, order_id, _filled_cb,
+            on_timeout=_make_fill_timeout_cb(symbol, order_id, application),
+        )
     )
 
 
@@ -643,7 +716,10 @@ async def recover_state(application: Application) -> None:
             await _on_order_filled(order, application)
 
         _state.fill_poll_task = asyncio.create_task(
-            trade_exec.poll_order_fill(symbol, order_id, _filled_cb)
+            trade_exec.poll_order_fill(
+                symbol, order_id, _filled_cb,
+                on_timeout=_make_fill_timeout_cb(symbol, order_id, application),
+            )
         )
         await send_alert(
             f"🚀 *Bot restarted.*\n\nSymbol: `{symbol}`\nStatus: Waiting for fill on `{order_id}`",
@@ -655,7 +731,9 @@ async def recover_state(application: Application) -> None:
         entry_price = row.get("entry_price")
         entry_qty = row.get("qty")
         exit_order_id = config.get("exit_order_id")
-        sl_pct: float = config.get("stop_loss_pct", 0.985)
+        # Use the absolute stop_loss stored in the DB row — it was written by
+        # _on_order_filled from the OB-derived sl_price and is exact.
+        sl_price_raw = row.get("stop_loss")
 
         if not entry_price or not entry_qty:
             await db.reset_state()
@@ -663,16 +741,18 @@ async def recover_state(application: Application) -> None:
             await send_alert("⚠️ *Bot restarted.* Open trade state incomplete — reset.", application)
             return
 
+        entry_price_f = float(entry_price)
+        sl_price = float(sl_price_raw) if sl_price_raw is not None else None
+
         _start_ws(symbol)
         _arm_sl_watcher(
             symbol=symbol,
-            entry_price=float(entry_price),
+            entry_price=entry_price_f,
             entry_qty=float(entry_qty),
             exit_order_id=exit_order_id,
-            sl_pct=sl_pct,
             application=application,
+            sl_price=sl_price,
         )
-        sl_price = row.get("stop_loss") or round(float(entry_price) * sl_pct, 8)
         tp_price = config.get("take_profit_price", "—")
         await send_alert(
             f"🚀 *Bot restarted.*\n\n"
@@ -704,7 +784,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg = row.get("config", {}) if row else {}
     trade_status = cfg.get("trade_status", "idle")
     symbol = (row.get("symbol") if row else None) or "—"
-    current_price = _state.analyzer._current_price
+    current_price = _state.analyzer.current_price
     sma = _state.analyzer.sma()
 
     if trade_status == "searching":
@@ -757,7 +837,7 @@ async def _cb_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     cfg = row.get("config", {}) if row else {}
     trade_status = cfg.get("trade_status", "idle")
     symbol = (row.get("symbol") if row else None) or "—"
-    current_price = _state.analyzer._current_price
+    current_price = _state.analyzer.current_price
     sma = _state.analyzer.sma()
 
     if trade_status == "searching":

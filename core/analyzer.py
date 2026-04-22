@@ -34,12 +34,19 @@ Data flow:
     fetch_klines()  → detect_order_blocks()  → find_entry_signal()
     update_depth()  → _confirm_ob_volume()
     update_price()  → SMA-20 + SL watcher feed
+
+Order-book state:
+    MEXC's `increase.depth` stream sends *incremental* deltas, not full
+    snapshots.  update_depth() applies each delta to a sorted dict:
+      - volume > 0  → set or update the price level
+      - volume == 0 → remove the price level
+    top_bids() / top_asks() expose the top-N levels for analysis.
 """
 
 import logging
 import statistics
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
 logger = logging.getLogger(__name__)
@@ -129,8 +136,10 @@ class MarketAnalyzer:
         self.tp_fallback_pct = tp_fallback_pct
 
         self._prices: deque[float] = deque(maxlen=sma_period)
-        self._bids: list[list[str]] = []
-        self._asks: list[list[str]] = []
+        # Incremental order-book state: {price_float: volume_float}.
+        # Bids sorted descending, asks sorted ascending via top_bids/top_asks.
+        self._bid_book: dict[float, float] = {}
+        self._ask_book: dict[float, float] = {}
         self._current_price: float = 0.0
 
         # Populated by detect_order_blocks()
@@ -144,11 +153,52 @@ class MarketAnalyzer:
         self._prices.append(price)
 
     def update_depth(self, bids: list[list[str]], asks: list[list[str]]) -> None:
-        self._bids = bids
-        self._asks = asks
-        # Re-confirm all OBs whenever the book updates
+        """
+        Apply an incremental depth delta from the MEXC `increase.depth` stream.
+
+        Each entry is [price_str, volume_str].  A volume of "0" means the
+        level has been removed from the book.  Levels with volume > 0 are
+        inserted or updated.  This maintains a correct accumulated book state
+        across all delta messages rather than replacing the book each time.
+        """
+        for row in bids:
+            try:
+                price, vol = float(row[0]), float(row[1])
+            except (ValueError, IndexError):
+                continue
+            if vol == 0.0:
+                self._bid_book.pop(price, None)
+            else:
+                self._bid_book[price] = vol
+
+        for row in asks:
+            try:
+                price, vol = float(row[0]), float(row[1])
+            except (ValueError, IndexError):
+                continue
+            if vol == 0.0:
+                self._ask_book.pop(price, None)
+            else:
+                self._ask_book[price] = vol
+
+        # Re-confirm all OBs against the updated book
         for ob in self._bullish_obs + self._bearish_obs:
             ob.volume_confirmed = self._confirm_ob_volume(ob)
+
+    # ── Book accessors ─────────────────────────────────────────────────────────
+
+    @property
+    def current_price(self) -> float:
+        """Latest price tick received from the WS ticker stream."""
+        return self._current_price
+
+    def top_bids(self, n: int = 20) -> list[tuple[float, float]]:
+        """Return the top-n bid levels sorted by price descending."""
+        return sorted(self._bid_book.items(), key=lambda x: x[0], reverse=True)[:n]
+
+    def top_asks(self, n: int = 20) -> list[tuple[float, float]]:
+        """Return the top-n ask levels sorted by price ascending."""
+        return sorted(self._ask_book.items(), key=lambda x: x[0])[:n]
 
     # ── OB detection ───────────────────────────────────────────────────────────
 
@@ -236,23 +286,13 @@ class MarketAnalyzer:
         Falls back to True when no book data is available yet (avoids blocking
         signal detection on startup before the first depth snapshot arrives).
         """
-        levels = self._bids if ob.kind == "bullish" else self._asks
+        levels = self.top_bids() if ob.kind == "bullish" else self.top_asks()
         if not levels:
             return True  # no book data yet — optimistic default
 
-        parsed: list[tuple[float, float]] = []
-        for row in levels:
-            try:
-                parsed.append((float(row[0]), float(row[1])))
-            except (ValueError, IndexError):
-                continue
-
-        if not parsed:
-            return True
-
-        all_vols = [v for _, v in parsed]
+        all_vols = [v for _, v in levels]
         avg_vol = statistics.mean(all_vols) or 1e-10
-        zone_vol = sum(v for p, v in parsed if ob.low <= p <= ob.high)
+        zone_vol = sum(v for p, v in levels if ob.low <= p <= ob.high)
 
         confirmed = zone_vol >= avg_vol * self.ob_volume_threshold
         logger.debug(
@@ -262,30 +302,20 @@ class MarketAnalyzer:
         )
         return confirmed
 
-    # ── Wall detection (kept for compatibility / dashboard display) ────────────
+    # ── Wall detection ─────────────────────────────────────────────────────────
 
     def find_walls(self, side: str = "bid") -> list[WallLevel]:
-        levels = self._bids if side == "bid" else self._asks
+        levels = self.top_bids() if side == "bid" else self.top_asks()
         if not levels:
             return []
 
-        parsed: list[tuple[float, float]] = []
-        for row in levels:
-            try:
-                parsed.append((float(row[0]), float(row[1])))
-            except (ValueError, IndexError):
-                continue
-
-        if not parsed:
-            return []
-
-        volumes = [v for _, v in parsed]
+        volumes = [v for _, v in levels]
         avg_vol = statistics.mean(volumes)
         threshold = avg_vol * self.wall_multiplier
 
         walls = [
             WallLevel(price=p, volume=v, side=side)
-            for p, v in parsed
+            for p, v in levels
             if v >= threshold
         ]
         walls.sort(key=lambda w: w.volume, reverse=True)
@@ -405,8 +435,8 @@ class MarketAnalyzer:
     def reset(self) -> None:
         """Clear all accumulated data (called between trades)."""
         self._prices.clear()
-        self._bids = []
-        self._asks = []
+        self._bid_book.clear()
+        self._ask_book.clear()
         self._current_price = 0.0
         self._bullish_obs = []
         self._bearish_obs = []
