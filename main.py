@@ -2,29 +2,29 @@
 Entry point for the MEXC Passive Market Maker bot.
 
 Startup sequence:
-1. Validate required environment variables.
-2. Build the Telegram Application.
-3. Register a post-init hook that runs inside the event loop:
-   a. Reads data/state.json.
-   b. If an active trade exists, re-attaches the WebSocket listener and
+1. Validate required environment variables (including Supabase credentials).
+2. Initialise the Supabase DatabaseManager singleton.
+3. Build the Telegram Application.
+4. Register a post-init hook that runs inside the event loop:
+   a. Ensures the bot_state singleton row exists in Supabase.
+   b. If is_active == true, re-attaches the WebSocket listener and
       Virtual Stop-Loss watcher automatically (no user command needed).
    c. Sends a startup notification to all ALLOWED_USER_IDS.
-4. Start long-polling.
+5. Start long-polling.
 
 Railway deployment notes:
 - Runs as a `worker` dyno (no inbound HTTP port needed).
-- Set STATE_PATH=/data/state.json and mount a Railway volume at /data so
-  state survives deploys and container restarts.
+- Set SUPABASE_URL and SUPABASE_KEY in the Railway Variables tab.
 - Set LOG_LEVEL=DEBUG for verbose output during debugging.
 """
 
-import asyncio
 import logging
 import sys
 
 from telegram.ext import Application
 
 from config.settings import LOG_LEVEL, validate_env
+from utils.db_manager import init_db
 from bot.telegram_bot import build_application, recover_state
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -63,6 +63,15 @@ def main() -> None:
         logger.error(
             "Set them in Railway's dashboard (Variables tab) or in a local .env file."
         )
+        sys.exit(1)
+
+    # Initialise the Supabase client before the event loop starts.
+    # This validates credentials eagerly so a bad key fails at boot, not mid-trade.
+    try:
+        init_db()
+        logger.info("Supabase client ready")
+    except Exception as exc:
+        logger.error("Failed to initialise Supabase: %s", exc)
         sys.exit(1)
 
     logger.info("Starting MEXC Market Maker bot…")

@@ -7,21 +7,15 @@ Responsibilities:
 - Place limit buy / limit sell orders.
 - Execute market sell for emergency exits.
 - Run the Virtual Stop-Loss asyncio task that monitors live price and
-  triggers an emergency market sell when price drops to entry * 0.985.
+  triggers an emergency market sell when price drops to entry * stop_loss_pct.
 
-Virtual Stop-Loss flow:
-    place_limit_buy()
-        └─ on fill detected → start_virtual_sl_watcher()
-                └─ price ≤ stop_loss_price?
-                        ├─ cancel pending exit order
-                        ├─ market_sell()
-                        └─ notify Telegram
+State persistence is handled exclusively via utils.db_manager (Supabase).
+No local file I/O occurs in this module.
 """
 
 import asyncio
 import hashlib
 import hmac
-import json
 import logging
 import time
 from typing import Any, Callable, Coroutine
@@ -29,7 +23,6 @@ from urllib.parse import urlencode
 
 import aiohttp
 
-from config import settings
 from config.settings import (
     MEXC_API_KEY,
     MEXC_BASE_URL,
@@ -40,16 +33,12 @@ from config.settings import (
 
 logger = logging.getLogger(__name__)
 
-# Async callback type: receives a message string, sends it to Telegram
 TelegramNotifier = Callable[[str], Coroutine[Any, Any, None]]
 
-STATE_PATH = "data/state.json"
 
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ── HMAC signing ───────────────────────────────────────────────────────────────
 
 def _sign(params: dict) -> str:
-    """Return HMAC-SHA256 hex signature for the given params dict."""
     query = urlencode(params)
     return hmac.new(
         MEXC_SECRET_KEY.encode(), query.encode(), hashlib.sha256
@@ -64,20 +53,7 @@ def _timestamp() -> int:
     return int(time.time() * 1000)
 
 
-def _load_state() -> dict:
-    try:
-        with open(STATE_PATH) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-
-def _save_state(state: dict) -> None:
-    with open(STATE_PATH, "w") as f:
-        json.dump(state, f, indent=2)
-
-
-# ── REST client ────────────────────────────────────────────────────────────────
+# ── Generic REST client ────────────────────────────────────────────────────────
 
 async def _request(
     method: str,
@@ -85,10 +61,7 @@ async def _request(
     params: dict | None = None,
     signed: bool = False,
 ) -> dict:
-    """
-    Generic async REST call to MEXC.
-    Raises RuntimeError on non-2xx responses.
-    """
+    """Async REST call to MEXC. Raises RuntimeError on non-2xx responses."""
     params = params or {}
     if signed:
         params["timestamp"] = _timestamp()
@@ -100,19 +73,19 @@ async def _request(
             async with session.get(url, params=params, headers=_headers()) as resp:
                 data = await resp.json()
                 if resp.status not in (200, 201):
-                    raise RuntimeError(f"MEXC {method} {path} → {resp.status}: {data}")
+                    raise RuntimeError(f"MEXC GET {path} → {resp.status}: {data}")
                 return data
         elif method == "POST":
             async with session.post(url, params=params, headers=_headers()) as resp:
                 data = await resp.json()
                 if resp.status not in (200, 201):
-                    raise RuntimeError(f"MEXC {method} {path} → {resp.status}: {data}")
+                    raise RuntimeError(f"MEXC POST {path} → {resp.status}: {data}")
                 return data
         elif method == "DELETE":
             async with session.delete(url, params=params, headers=_headers()) as resp:
                 data = await resp.json()
                 if resp.status not in (200, 201):
-                    raise RuntimeError(f"MEXC {method} {path} → {resp.status}: {data}")
+                    raise RuntimeError(f"MEXC DELETE {path} → {resp.status}: {data}")
                 return data
         else:
             raise ValueError(f"Unsupported HTTP method: {method}")
@@ -123,9 +96,7 @@ async def _request(
 async def fetch_precision(symbol: str) -> dict:
     """
     Query MEXC exchangeInfo for the given symbol and populate the
-    precision cache in config.settings.
-
-    Returns the precision dict: {price_precision, qty_precision, tick_size}.
+    in-memory precision cache. Returns the precision dict.
     """
     data = await _request("GET", "/api/v3/exchangeInfo", {"symbol": symbol.upper()})
     symbols = data.get("symbols", [])
@@ -133,7 +104,6 @@ async def fetch_precision(symbol: str) -> dict:
         raise RuntimeError(f"Symbol {symbol} not found in exchangeInfo")
 
     info = symbols[0]
-    # Derive price precision from tickSize (e.g. "0.01" → 2 decimal places)
     tick_size: str = "0.01"
     price_precision: int = info.get("quotePrecision", 8)
     qty_precision: int = info.get("baseAssetPrecision", 8)
@@ -141,7 +111,6 @@ async def fetch_precision(symbol: str) -> dict:
     for f in info.get("filters", []):
         if f.get("filterType") == "PRICE_FILTER":
             tick_size = f.get("tickSize", tick_size)
-            # Count decimal places in tick_size
             if "." in tick_size:
                 price_precision = len(tick_size.rstrip("0").split(".")[1])
             break
@@ -155,12 +124,7 @@ async def fetch_precision(symbol: str) -> dict:
 # ── Order placement ────────────────────────────────────────────────────────────
 
 async def place_limit_buy(symbol: str, price: float, quote_amount: float) -> dict:
-    """
-    Place a GTC limit buy order.
-
-    qty is derived from quote_amount / price, rounded to qty_precision.
-    Returns the raw MEXC order response.
-    """
+    """Place a GTC limit buy. qty = quote_amount / price."""
     prec = get_precision(symbol)
     qty = round(quote_amount / price, prec["qty_precision"])
     price_str = f"{price:.{prec['price_precision']}f}"
@@ -182,7 +146,7 @@ async def place_limit_buy(symbol: str, price: float, quote_amount: float) -> dic
 
 
 async def place_limit_sell(symbol: str, price: float, qty: float) -> dict:
-    """Place a GTC limit sell order at the given price."""
+    """Place a GTC limit sell."""
     prec = get_precision(symbol)
     price_str = f"{price:.{prec['price_precision']}f}"
     qty_str = f"{qty:.{prec['qty_precision']}f}"
@@ -228,8 +192,7 @@ async def cancel_order(symbol: str, order_id: str) -> dict:
         "recvWindow": 5000,
     }
     logger.info("Cancelling order %s on %s", order_id, symbol)
-    resp = await _request("DELETE", "/api/v3/order", params, signed=True)
-    return resp
+    return await _request("DELETE", "/api/v3/order", params, signed=True)
 
 
 async def get_order(symbol: str, order_id: str) -> dict:
@@ -246,16 +209,17 @@ async def get_order(symbol: str, order_id: str) -> dict:
 
 class VirtualStopLossWatcher:
     """
-    Monitors live price via a shared asyncio.Event / price variable and
-    triggers an emergency market sell when the stop-loss level is breached.
+    Monitors live price and triggers an emergency market sell when
+    price drops to entry_price * stop_loss_pct.
+
+    State is persisted to Supabase (via db_manager) on trigger so the
+    closed status survives a restart.
 
     Usage:
         watcher = VirtualStopLossWatcher(...)
         asyncio.create_task(watcher.run())
-        # Feed prices from the WS ticker:
-        watcher.update_price(current_price)
-        # Cancel cleanly when trade closes normally:
-        watcher.cancel()
+        watcher.update_price(price)   # called from WS ticker handler
+        watcher.cancel()              # called when trade closes normally
     """
 
     def __init__(
@@ -287,20 +251,17 @@ class VirtualStopLossWatcher:
         )
 
     def update_price(self, price: float) -> None:
-        """Called by the WS ticker handler with each new price tick."""
+        """Feed a new price tick from the WS ticker handler."""
         self._current_price = price
         self._price_event.set()
 
     def cancel(self) -> None:
         """Signal the watcher to stop (trade closed normally)."""
         self._cancelled = True
-        self._price_event.set()  # unblock the wait
+        self._price_event.set()
 
     async def run(self) -> None:
-        """
-        Main watcher loop.  Waits for price updates and checks the SL level.
-        Exits when cancelled or after triggering.
-        """
+        """Main loop: wait for price ticks, check SL level."""
         logger.info("VirtualSL watcher started for %s", self.symbol)
         while not self._cancelled and not self._triggered:
             self._price_event.clear()
@@ -320,14 +281,21 @@ class VirtualStopLossWatcher:
         logger.info("VirtualSL watcher stopped for %s", self.symbol)
 
     async def _trigger_emergency_exit(self, current_price: float) -> None:
-        """Execute the emergency exit sequence."""
+        """
+        Emergency exit sequence:
+        1. Cancel pending TP limit order.
+        2. Market sell.
+        3. Reset Supabase state to idle.
+        4. Notify Telegram.
+        5. Run on_triggered callback.
+        """
         self._triggered = True
         logger.warning(
             "STOP-LOSS TRIGGERED: price=%.8f ≤ sl=%.8f",
             current_price, self.stop_loss_price,
         )
 
-        # 1. Cancel the pending limit exit order
+        # 1. Cancel take-profit order
         if self.exit_order_id:
             try:
                 await cancel_order(self.symbol, self.exit_order_id)
@@ -335,22 +303,22 @@ class VirtualStopLossWatcher:
             except Exception as exc:
                 logger.error("Failed to cancel exit order: %s", exc)
 
-        # 2. Execute immediate market sell
+        # 2. Market sell
+        sell_order_id = "FAILED"
         try:
             resp = await market_sell(self.symbol, self.qty)
             sell_order_id = resp.get("orderId", "unknown")
         except Exception as exc:
             logger.error("Market sell failed: %s", exc)
-            sell_order_id = "FAILED"
 
-        # 3. Persist state
-        state = _load_state()
-        state["trade"]["status"] = "closed"
-        state["trade"]["exit_reason"] = "virtual_stop_loss"
-        state["trade"]["closed_at"] = int(time.time())
-        _save_state(state)
+        # 3. Reset Supabase state
+        try:
+            from utils.db_manager import get_db
+            await get_db().reset_state()
+        except Exception as exc:
+            logger.error("Failed to reset Supabase state after SL trigger: %s", exc)
 
-        # 4. Notify via Telegram
+        # 4. Telegram alert
         msg = (
             "🚨 *EMERGENCY EXIT — Virtual Stop-Loss Triggered*\n\n"
             f"Symbol: `{self.symbol}`\n"
@@ -365,7 +333,7 @@ class VirtualStopLossWatcher:
         except Exception as exc:
             logger.error("Telegram notification failed: %s", exc)
 
-        # 5. Run optional post-trigger callback (e.g. reset bot state)
+        # 5. Post-trigger callback (resets in-memory bot state)
         if self.on_triggered:
             try:
                 await self.on_triggered()
@@ -383,11 +351,8 @@ async def poll_order_fill(
     timeout: float = 3600.0,
 ) -> None:
     """
-    Poll an order's status every `poll_interval` seconds until it is FILLED
-    or `timeout` seconds have elapsed.
-
-    Calls `on_filled(order_data)` when the order status becomes "FILLED".
-    This is used to detect when the limit buy is filled and arm the SL watcher.
+    Poll an order's status every poll_interval seconds until FILLED or timeout.
+    Calls on_filled(order_data) when status becomes "FILLED".
     """
     deadline = time.time() + timeout
     logger.info("Polling fill for order %s on %s", order_id, symbol)
@@ -403,7 +368,9 @@ async def poll_order_fill(
                 await on_filled(order)
                 return
             elif status in ("CANCELED", "REJECTED", "EXPIRED"):
-                logger.warning("Order %s ended with status %s — stopping poll", order_id, status)
+                logger.warning(
+                    "Order %s ended with status %s — stopping poll", order_id, status
+                )
                 return
         except Exception as exc:
             logger.error("Error polling order %s: %s", order_id, exc)

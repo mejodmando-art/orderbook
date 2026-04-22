@@ -3,17 +3,11 @@ Telegram bot interface.
 
 Commands:
     /setup  <symbol> <quote_amount> [sl_pct] [tp_pct]
-        Configure and start the market-maker strategy.
-        Example: /setup BTCUSDT 100 1.5 2.0
-
     /status
-        Show current trade state, SMA, and session P&L.
-
     /emergency_stop
-        Immediately cancel all open orders and market-sell any open position.
 
-All commands are restricted to ALLOWED_USER_IDS from .env.
-The bot uses python-telegram-bot v20+ (Application / async handlers).
+All commands are restricted to ALLOWED_USER_IDS.
+State is persisted to Supabase via utils.db_manager — no local file I/O.
 
 Public functions used by main.py:
     build_application() -> Application
@@ -21,29 +15,19 @@ Public functions used by main.py:
 """
 
 import asyncio
-import json
 import logging
-import os
 import time
 from typing import TYPE_CHECKING
 
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-from config.settings import (
-    ALLOWED_USER_IDS,
-    STATE_PATH,
-    TELEGRAM_BOT_TOKEN,
-    get_precision,
-)
+from config.settings import ALLOWED_USER_IDS, TELEGRAM_BOT_TOKEN, get_precision
 from core import trade_exec
 from core.analyzer import MarketAnalyzer
 from core.mexc_ws import MexcWebSocket
+from utils.db_manager import get_db
 
 if TYPE_CHECKING:
     from core.trade_exec import VirtualStopLossWatcher
@@ -51,10 +35,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# ── Shared bot state ───────────────────────────────────────────────────────────
+# ── In-memory runtime state ────────────────────────────────────────────────────
 
 class BotState:
-    """Mutable runtime state shared across command handlers."""
+    """
+    Volatile runtime state (tasks, watcher handles, cached config).
+    Authoritative persistent state lives in Supabase — this is only
+    the in-process view needed to manage asyncio tasks.
+    """
 
     def __init__(self) -> None:
         self.ws = MexcWebSocket()
@@ -65,56 +53,8 @@ class BotState:
         self.fill_poll_task: asyncio.Task | None = None
         self.running: bool = False
 
+        # Mirrors the Supabase config jsonb column; populated on /setup or recovery
         self.config: dict = {}
-        self.trade: dict = {}
-        self.session: dict = {}
-
-        self._load()
-
-    def _load(self) -> None:
-        """Load persisted state from disk. Safe to call at any time."""
-        try:
-            os.makedirs(os.path.dirname(STATE_PATH) or ".", exist_ok=True)
-            with open(STATE_PATH) as f:
-                data = json.load(f)
-            self.config = data.get("config", {})
-            self.trade = data.get("trade", {})
-            self.session = data.get("session", {})
-            logger.info(
-                "State loaded: trade_status=%s symbol=%s",
-                self.trade.get("status", "idle"),
-                self.config.get("symbol", "—"),
-            )
-        except (FileNotFoundError, json.JSONDecodeError):
-            self.config = {}
-            self.trade = {"status": "idle"}
-            self.session = {"total_trades": 0, "total_pnl": 0.0, "wins": 0, "losses": 0}
-            logger.info("No existing state found — starting fresh")
-
-    def save(self) -> None:
-        os.makedirs(os.path.dirname(STATE_PATH) or ".", exist_ok=True)
-        with open(STATE_PATH, "w") as f:
-            json.dump(
-                {"config": self.config, "trade": self.trade, "session": self.session},
-                f, indent=2,
-            )
-
-    def reset_trade(self) -> None:
-        self.trade = {
-            "status": "idle",
-            "entry_order_id": None,
-            "exit_order_id": None,
-            "entry_price": None,
-            "entry_qty": None,
-            "stop_loss_price": None,
-            "take_profit_price": None,
-            "filled_at": None,
-            "closed_at": None,
-            "pnl": None,
-            "exit_reason": None,
-        }
-        self.running = False
-        self.save()
 
 
 _state = BotState()
@@ -152,7 +92,6 @@ async def send_alert(text: str, application: Application | None = None) -> None:
 # ── WebSocket handlers ─────────────────────────────────────────────────────────
 
 async def _on_ticker(msg: dict) -> None:
-    """Handle miniTicker messages: update analyzer price and SL watcher."""
     data = msg.get("d", {})
     price_str = data.get("c") or data.get("p")
     if not price_str:
@@ -161,14 +100,12 @@ async def _on_ticker(msg: dict) -> None:
         price = float(price_str)
     except ValueError:
         return
-
     _state.analyzer.update_price(price)
     if _state.sl_watcher:
         _state.sl_watcher.update_price(price)
 
 
 async def _on_depth(msg: dict) -> None:
-    """Handle order-book depth messages."""
     data = msg.get("d", {})
     bids = data.get("bids", [])
     asks = data.get("asks", [])
@@ -201,7 +138,7 @@ def _arm_sl_watcher(
         await send_alert(text, application)
 
     async def _on_sl_triggered() -> None:
-        _state.reset_trade()
+        _state.running = False
         _state.sl_watcher = None
 
     watcher = trade_exec.VirtualStopLossWatcher(
@@ -216,7 +153,8 @@ def _arm_sl_watcher(
     _state.sl_watcher = watcher
     _state.sl_task = asyncio.create_task(watcher.run())
     logger.info(
-        "Virtual SL watcher armed: entry=%.8f sl=%.8f", entry_price, entry_price * sl_pct
+        "Virtual SL watcher armed: entry=%.8f sl=%.8f",
+        entry_price, entry_price * sl_pct,
     )
 
 
@@ -224,15 +162,17 @@ def _arm_sl_watcher(
 
 async def _on_order_filled(order: dict, application: Application) -> None:
     """
-    Called when the limit buy order is confirmed FILLED.
-    Places the take-profit limit sell and arms the Virtual SL watcher.
+    Called when the limit buy is confirmed FILLED.
+    Places the take-profit limit sell, persists to Supabase, arms SL watcher.
     """
+    db = get_db()
     symbol: str = _state.config["symbol"]
     entry_price = float(order.get("price", 0))
     entry_qty = float(order.get("executedQty", 0))
     sl_pct: float = _state.config.get("stop_loss_pct", 0.985)
     tp_pct: float = _state.config.get("take_profit_pct", 1.02)
     tp_price = round(entry_price * tp_pct, get_precision(symbol)["price_precision"])
+    sl_price = round(entry_price * sl_pct, 8)
 
     try:
         tp_resp = await trade_exec.place_limit_sell(symbol, tp_price, entry_qty)
@@ -241,16 +181,22 @@ async def _on_order_filled(order: dict, application: Application) -> None:
         logger.error("Failed to place TP sell: %s", exc)
         exit_order_id = None
 
-    _state.trade.update({
-        "status": "open",
+    # Persist open trade to Supabase
+    await db.upsert_state({
+        "symbol": symbol,
+        "is_active": True,
         "entry_price": entry_price,
-        "entry_qty": entry_qty,
-        "exit_order_id": exit_order_id,
-        "stop_loss_price": round(entry_price * sl_pct, 8),
-        "take_profit_price": tp_price,
-        "filled_at": int(time.time()),
+        "side": "buy",
+        "qty": entry_qty,
+        "stop_loss": sl_price,
+        "config": {
+            **_state.config,
+            "exit_order_id": exit_order_id,
+            "take_profit_price": tp_price,
+            "filled_at": int(time.time()),
+            "trade_status": "open",
+        },
     })
-    _state.save()
 
     await send_alert(
         f"✅ *Order Filled*\n\n"
@@ -258,7 +204,7 @@ async def _on_order_filled(order: dict, application: Application) -> None:
         f"Entry: `{entry_price}`\n"
         f"Qty: `{entry_qty}`\n"
         f"TP: `{tp_price}`\n"
-        f"SL: `{_state.trade['stop_loss_price']}`",
+        f"SL: `{sl_price}`",
         application,
     )
 
@@ -267,9 +213,10 @@ async def _on_order_filled(order: dict, application: Application) -> None:
 
 async def _start_strategy(application: Application) -> None:
     """
-    Subscribe to WS streams, start the WS task, and place the initial
-    limit buy order based on the analyzer's entry signal.
+    Subscribe to WS streams, wait for an entry signal, place the limit buy,
+    then start the fill poller.
     """
+    db = get_db()
     symbol: str = _state.config["symbol"]
     quote_amount: float = _state.config["quote_amount"]
     tick_size: float = float(get_precision(symbol)["tick_size"])
@@ -299,6 +246,7 @@ async def _start_strategy(application: Application) -> None:
             application,
         )
         _state.running = False
+        await db.reset_state()
         return
 
     try:
@@ -306,15 +254,25 @@ async def _start_strategy(application: Application) -> None:
     except Exception as exc:
         await send_alert(f"❌ *Limit buy failed:* `{exc}`", application)
         _state.running = False
+        await db.reset_state()
         return
 
     order_id = buy_resp.get("orderId")
-    _state.trade.update({
-        "status": "pending_fill",
-        "entry_order_id": order_id,
+
+    # Persist pending state to Supabase
+    await db.upsert_state({
+        "symbol": symbol,
+        "is_active": True,
         "entry_price": signal.entry_price,
+        "side": "buy",
+        "qty": None,          # not yet known until fill
+        "stop_loss": round(signal.entry_price * _state.config.get("stop_loss_pct", 0.985), 8),
+        "config": {
+            **_state.config,
+            "entry_order_id": order_id,
+            "trade_status": "pending_fill",
+        },
     })
-    _state.save()
 
     await send_alert(
         f"📋 *Limit Buy Placed*\n\n"
@@ -338,34 +296,44 @@ async def _start_strategy(application: Application) -> None:
 
 async def recover_state(application: Application) -> None:
     """
-    Re-attach live monitoring after a restart without requiring a new /setup.
+    On startup, query Supabase for an active trade and re-attach all
+    live monitoring without requiring a new /setup command.
 
-    Three cases based on trade.status in state.json:
-
-    idle          → nothing to recover; send a clean-start notification.
-
-    pending_fill  → the limit buy was placed but not yet filled before the
-                    restart. Re-attach the fill poller so we still catch the
-                    fill and arm the SL watcher when it happens.
-
-    open          → the position is live. Re-attach the WebSocket and re-arm
-                    the Virtual Stop-Loss watcher immediately using the entry
-                    price and qty already stored in state.
+    Cases:
+        is_active = false  → idle; notify and wait for /setup.
+        trade_status = pending_fill → re-attach fill poller.
+        trade_status = open         → re-arm WS + Virtual SL watcher.
     """
-    trade_status = _state.trade.get("status", "idle")
-    symbol = _state.config.get("symbol")
+    db = get_db()
 
-    logger.info("recover_state: trade_status=%s symbol=%s", trade_status, symbol)
+    # Guarantee the singleton row exists before any reads
+    await db.ensure_row_exists()
 
-    # ── Case 1: nothing active ─────────────────────────────────────────────────
-    if trade_status == "idle" or not symbol:
+    row = await db.fetch_state()
+    if not row or not row.get("is_active"):
         await send_alert(
             "🚀 *Bot started.*\n\nNo active trade found. Use /setup to begin.",
             application,
         )
         return
 
-    # Precision lives only in memory — must be re-fetched on every cold start.
+    symbol: str = row.get("symbol", "")
+    config: dict = row.get("config", {})
+    trade_status: str = config.get("trade_status", "")
+
+    logger.info("Recovery: is_active=True symbol=%s trade_status=%s", symbol, trade_status)
+
+    if not symbol:
+        logger.warning("is_active=True but no symbol — resetting")
+        await db.reset_state()
+        await send_alert(
+            "⚠️ *Bot restarted.* Inconsistent state (no symbol) — reset.\n"
+            "Use /setup to begin.",
+            application,
+        )
+        return
+
+    # Precision lives only in memory — must be re-fetched on every cold start
     try:
         await trade_exec.fetch_precision(symbol)
     except Exception as exc:
@@ -377,20 +345,24 @@ async def recover_state(application: Application) -> None:
         )
         return
 
-    # ── Case 2: waiting for limit buy to fill ──────────────────────────────────
+    # Restore in-memory config from the Supabase config jsonb column
+    _state.config = config
+    _state.running = True
+
+    # ── pending_fill: re-attach fill poller ────────────────────────────────────
     if trade_status == "pending_fill":
-        order_id = _state.trade.get("entry_order_id")
+        order_id = config.get("entry_order_id")
         if not order_id:
-            logger.warning("pending_fill state but no entry_order_id — resetting")
-            _state.reset_trade()
+            logger.warning("pending_fill but no entry_order_id — resetting")
+            await db.reset_state()
+            _state.running = False
             await send_alert(
-                "⚠️ *Bot restarted.* Inconsistent pending_fill state — trade reset.\n"
+                "⚠️ *Bot restarted.* Inconsistent pending_fill state — reset.\n"
                 "Use /setup to begin a new trade.",
                 application,
             )
             return
 
-        _state.running = True
         _start_ws(symbol)
 
         async def _filled_cb(order: dict) -> None:
@@ -404,31 +376,31 @@ async def recover_state(application: Application) -> None:
             "🚀 *Bot restarted and synchronised with current state.*\n\n"
             f"Symbol: `{symbol}`\n"
             f"Status: Waiting for fill on order `{order_id}`\n"
-            f"Entry price: `{_state.trade.get('entry_price')}`\n\n"
+            f"Entry price: `{row.get('entry_price')}`\n\n"
             "WebSocket and fill poller re-attached.",
             application,
         )
         logger.info("Recovery: fill poller re-attached for order %s", order_id)
         return
 
-    # ── Case 3: position is open — re-arm SL watcher ──────────────────────────
+    # ── open: re-arm Virtual SL watcher ───────────────────────────────────────
     if trade_status == "open":
-        entry_price = _state.trade.get("entry_price")
-        entry_qty = _state.trade.get("entry_qty")
-        exit_order_id = _state.trade.get("exit_order_id")
-        sl_pct: float = _state.config.get("stop_loss_pct", 0.985)
+        entry_price = row.get("entry_price")
+        entry_qty = row.get("qty")
+        exit_order_id = config.get("exit_order_id")
+        sl_pct: float = config.get("stop_loss_pct", 0.985)
 
         if not entry_price or not entry_qty:
-            logger.warning("open state but missing entry_price/qty — resetting")
-            _state.reset_trade()
+            logger.warning("open trade but missing entry_price/qty — resetting")
+            await db.reset_state()
+            _state.running = False
             await send_alert(
-                "⚠️ *Bot restarted.* Open trade state is incomplete — trade reset.\n"
+                "⚠️ *Bot restarted.* Open trade state is incomplete — reset.\n"
                 "Check your MEXC account manually, then use /setup.",
                 application,
             )
             return
 
-        _state.running = True
         _start_ws(symbol)
         _arm_sl_watcher(
             symbol=symbol,
@@ -439,8 +411,8 @@ async def recover_state(application: Application) -> None:
             application=application,
         )
 
-        sl_price = round(float(entry_price) * sl_pct, 8)
-        tp_price = _state.trade.get("take_profit_price", "—")
+        sl_price = row.get("stop_loss") or round(float(entry_price) * sl_pct, 8)
+        tp_price = config.get("take_profit_price", "—")
 
         await send_alert(
             "🚀 *Bot restarted and synchronised with current state.*\n\n"
@@ -454,15 +426,16 @@ async def recover_state(application: Application) -> None:
         )
         logger.info(
             "Recovery: SL watcher re-armed for %s entry=%.8f sl=%.8f",
-            symbol, float(entry_price), sl_price,
+            symbol, float(entry_price), float(sl_price) if sl_price else 0,
         )
         return
 
-    # ── Unexpected status ──────────────────────────────────────────────────────
-    logger.warning("Unrecognised trade status '%s' on recovery — resetting", trade_status)
-    _state.reset_trade()
+    # ── Unknown status ─────────────────────────────────────────────────────────
+    logger.warning("Unknown trade_status '%s' on recovery — resetting", trade_status)
+    await db.reset_state()
+    _state.running = False
     await send_alert(
-        f"⚠️ *Bot restarted.* Unknown trade status `{trade_status}` — state reset.\n"
+        f"⚠️ *Bot restarted.* Unknown trade status `{trade_status}` — reset.\n"
         "Use /setup to begin.",
         application,
     )
@@ -474,8 +447,7 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /setup <symbol> <quote_amount> [sl_pct] [tp_pct]
 
-    Configures the bot and launches the strategy.
-    sl_pct and tp_pct are percentages (e.g. 1.5 means 1.5% stop-loss).
+    sl_pct / tp_pct are percentages (e.g. 1.5 = 1.5% stop-loss).
     """
     if not _is_allowed(update):
         await _deny(update)
@@ -500,7 +472,9 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if _state.running:
-        await update.message.reply_text("⚠️ Bot is already running. Use /emergency_stop first.")
+        await update.message.reply_text(
+            "⚠️ Bot is already running. Use /emergency_stop first."
+        )
         return
 
     await update.message.reply_text(
@@ -525,10 +499,21 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "price_precision": prec["price_precision"],
         "qty_precision": prec["qty_precision"],
         "tick_size": prec["tick_size"],
+        "started_at": int(time.time()),
+        "trade_status": "searching",
     }
-    _state.session["started_at"] = int(time.time())
-    _state.save()
     _state.running = True
+
+    # Write initial config to Supabase
+    await get_db().upsert_state({
+        "symbol": symbol,
+        "is_active": True,
+        "entry_price": None,
+        "side": "buy",
+        "qty": None,
+        "stop_loss": None,
+        "config": _state.config,
+    })
 
     await update.message.reply_text(
         f"✅ *Setup complete*\n\n"
@@ -545,19 +530,28 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/status — show current trade and session summary."""
+    """/status — show live price, Supabase state, and session info."""
     if not _is_allowed(update):
         await _deny(update)
         return
 
-    trade = _state.trade
-    cfg = _state.config
-    sess = _state.session
-    symbol = cfg.get("symbol", "—")
+    # Fetch authoritative state from Supabase
+    try:
+        row = await get_db().fetch_state()
+    except Exception as exc:
+        await update.message.reply_text(
+            f"❌ Failed to fetch state from Supabase: `{exc}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    cfg = row.get("config", {}) if row else {}
+    symbol = (row.get("symbol") if row else None) or "—"
+    trade_status = cfg.get("trade_status", "idle")
+    is_active = row.get("is_active", False) if row else False
 
     sma = _state.analyzer.sma()
     sma_str = f"`{sma:.8f}`" if sma else "_not ready_"
-
     current_price = _state.analyzer._current_price
     price_str = f"`{current_price:.8f}`" if current_price else "_no data_"
 
@@ -566,25 +560,22 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "",
         f"*Symbol:* `{symbol}`",
         f"*Running:* `{_state.running}`",
-        f"*Trade status:* `{trade.get('status', 'idle')}`",
+        f"*Trade status:* `{trade_status}`",
+        f"*Is active (DB):* `{is_active}`",
         "",
         f"*Live price:* {price_str}",
         f"*SMA-20:* {sma_str}",
         "",
-        f"*Entry price:* `{trade.get('entry_price', '—')}`",
-        f"*Entry qty:* `{trade.get('entry_qty', '—')}`",
-        f"*Stop-loss:* `{trade.get('stop_loss_price', '—')}`",
-        f"*Take-profit:* `{trade.get('take_profit_price', '—')}`",
-        "",
-        f"*Session trades:* `{sess.get('total_trades', 0)}`",
-        f"*Session P&L:* `{sess.get('total_pnl', 0.0):.4f}`",
-        f"*Wins / Losses:* `{sess.get('wins', 0)} / {sess.get('losses', 0)}`",
+        f"*Entry price:* `{row.get('entry_price', '—') if row else '—'}`",
+        f"*Qty:* `{row.get('qty', '—') if row else '—'}`",
+        f"*Stop-loss:* `{row.get('stop_loss', '—') if row else '—'}`",
+        f"*Take-profit:* `{cfg.get('take_profit_price', '—')}`",
     ]
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_emergency_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/emergency_stop — cancel all orders and market-sell the open position."""
+    """/emergency_stop — cancel all orders, market-sell open position, reset DB."""
     if not _is_allowed(update):
         await _deny(update)
         return
@@ -593,13 +584,23 @@ async def cmd_emergency_stop(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "🛑 *Emergency stop initiated…*", parse_mode=ParseMode.MARKDOWN
     )
 
-    symbol = _state.config.get("symbol")
-    if not symbol:
-        await update.message.reply_text("No active symbol configured.")
-        _state.reset_trade()
-        return
+    db = get_db()
 
-    # 1. Disarm SL watcher first to prevent a race with the market sell below
+    # Fetch current state from Supabase for order IDs
+    try:
+        row = await db.fetch_state()
+    except Exception as exc:
+        await update.message.reply_text(
+            f"⚠️ Could not fetch state from Supabase: `{exc}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        row = None
+
+    cfg = row.get("config", {}) if row else {}
+    symbol = (row.get("symbol") if row else None) or _state.config.get("symbol")
+    trade_status = cfg.get("trade_status", "idle")
+
+    # 1. Disarm SL watcher (prevents race with market sell below)
     if _state.sl_watcher:
         _state.sl_watcher.cancel()
         _state.sl_watcher = None
@@ -608,57 +609,70 @@ async def cmd_emergency_stop(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if _state.fill_poll_task and not _state.fill_poll_task.done():
         _state.fill_poll_task.cancel()
 
-    # 3. Cancel pending entry order
-    entry_order_id = _state.trade.get("entry_order_id")
-    if entry_order_id and _state.trade.get("status") == "pending_fill":
-        try:
-            await trade_exec.cancel_order(symbol, entry_order_id)
-            await update.message.reply_text(
-                f"✅ Entry order `{entry_order_id}` cancelled.",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        except Exception as exc:
-            await update.message.reply_text(
-                f"⚠️ Could not cancel entry order: `{exc}`",
-                parse_mode=ParseMode.MARKDOWN,
-            )
+    if not symbol:
+        await update.message.reply_text("No active symbol found.")
+    else:
+        # 3. Cancel pending entry order
+        entry_order_id = cfg.get("entry_order_id")
+        if entry_order_id and trade_status == "pending_fill":
+            try:
+                await trade_exec.cancel_order(symbol, entry_order_id)
+                await update.message.reply_text(
+                    f"✅ Entry order `{entry_order_id}` cancelled.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception as exc:
+                await update.message.reply_text(
+                    f"⚠️ Could not cancel entry order: `{exc}`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
 
-    # 4. Cancel open take-profit order
-    exit_order_id = _state.trade.get("exit_order_id")
-    if exit_order_id and _state.trade.get("status") == "open":
-        try:
-            await trade_exec.cancel_order(symbol, exit_order_id)
-            await update.message.reply_text(
-                f"✅ Exit order `{exit_order_id}` cancelled.",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        except Exception as exc:
-            await update.message.reply_text(
-                f"⚠️ Could not cancel exit order: `{exc}`",
-                parse_mode=ParseMode.MARKDOWN,
-            )
+        # 4. Cancel take-profit order
+        exit_order_id = cfg.get("exit_order_id")
+        if exit_order_id and trade_status == "open":
+            try:
+                await trade_exec.cancel_order(symbol, exit_order_id)
+                await update.message.reply_text(
+                    f"✅ Exit order `{exit_order_id}` cancelled.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception as exc:
+                await update.message.reply_text(
+                    f"⚠️ Could not cancel exit order: `{exc}`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
 
-    # 5. Market sell open position
-    entry_qty = _state.trade.get("entry_qty")
-    if entry_qty and _state.trade.get("status") == "open":
-        try:
-            resp = await trade_exec.market_sell(symbol, float(entry_qty))
-            await update.message.reply_text(
-                f"✅ Market sell executed. Order ID: `{resp.get('orderId')}`",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        except Exception as exc:
-            await update.message.reply_text(
-                f"❌ Market sell failed: `{exc}`",
-                parse_mode=ParseMode.MARKDOWN,
-            )
+        # 5. Market sell open position
+        qty = row.get("qty") if row else None
+        if qty and trade_status == "open":
+            try:
+                resp = await trade_exec.market_sell(symbol, float(qty))
+                await update.message.reply_text(
+                    f"✅ Market sell executed. Order ID: `{resp.get('orderId')}`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception as exc:
+                await update.message.reply_text(
+                    f"❌ Market sell failed: `{exc}`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
 
     # 6. Stop WebSocket
     _state.ws.stop()
     if _state.ws_task and not _state.ws_task.done():
         _state.ws_task.cancel()
 
-    _state.reset_trade()
+    # 7. Reset Supabase state
+    try:
+        await db.reset_state()
+    except Exception as exc:
+        await update.message.reply_text(
+            f"⚠️ Failed to reset Supabase state: `{exc}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    _state.running = False
+    _state.config = {}
 
     await update.message.reply_text(
         "🔴 *Bot stopped. All positions closed.*", parse_mode=ParseMode.MARKDOWN

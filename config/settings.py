@@ -27,9 +27,14 @@ ALLOWED_USER_IDS: set[int] = {
     int(uid.strip()) for uid in _raw_ids.split(",") if uid.strip().isdigit()
 }
 
-# ── Runtime paths ──────────────────────────────────────────────────────────────
-# On Railway, mount a persistent volume at /data and set STATE_PATH=/data/state.json
-# so state survives deploys. Falls back to local data/ for development.
+# ── Supabase ───────────────────────────────────────────────────────────────────
+# Project URL and anon/service-role key from Supabase dashboard → Settings → API.
+# Use the service-role key (not anon) so the bot can bypass RLS.
+SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY: str = os.getenv("SUPABASE_KEY", "")
+
+# ── Runtime paths (local fallback only) ───────────────────────────────────────
+# state.json is no longer the primary store; kept for local dev without Supabase.
 STATE_PATH: str = os.getenv("STATE_PATH", "data/state.json")
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -90,4 +95,8 @@ def validate_env() -> list[str]:
         missing.append("TELEGRAM_BOT_TOKEN")
     if not ALLOWED_USER_IDS:
         missing.append("ALLOWED_USER_IDS")
+    if not SUPABASE_URL:
+        missing.append("SUPABASE_URL")
+    if not SUPABASE_KEY:
+        missing.append("SUPABASE_KEY")
     return missing
