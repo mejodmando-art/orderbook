@@ -14,7 +14,7 @@ Startup sequence:
 
 Railway deployment notes:
 - Runs as a `worker` dyno (no inbound HTTP port needed).
-- Set SUPABASE_URL and SUPABASE_KEY in the Railway Variables tab.
+- Set DATABASE_URL in the Railway Variables tab (Supabase pooler connection string).
 - Set LOG_LEVEL=DEBUG for verbose output during debugging.
 """
 
@@ -24,7 +24,7 @@ import sys
 from telegram.ext import Application
 
 from config.settings import LOG_LEVEL, validate_env
-from utils.db_manager import init_db
+from utils.db_manager import init_db  # async — awaited inside _on_startup
 from bot.telegram_bot import build_application, recover_state
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -48,9 +48,14 @@ logger = logging.getLogger(__name__)
 async def _on_startup(app: Application) -> None:
     """
     Called by python-telegram-bot after the event loop is running but before
-    the first update is processed.  Safe to create asyncio Tasks here.
+    the first update is processed.  Safe to await coroutines and create Tasks.
+
+    init_db() is awaited here (not in main()) because asyncpg.create_pool()
+    requires a running event loop.
     """
     logger.info("Running startup hook…")
+    await init_db()
+    logger.info("Database ready")
     await recover_state(app)
 
 
@@ -63,15 +68,6 @@ def main() -> None:
         logger.error(
             "Set them in Railway's dashboard (Variables tab) or in a local .env file."
         )
-        sys.exit(1)
-
-    # Initialise the Supabase client before the event loop starts.
-    # This validates credentials eagerly so a bad key fails at boot, not mid-trade.
-    try:
-        init_db()
-        logger.info("Supabase client ready")
-    except Exception as exc:
-        logger.error("Failed to initialise Supabase: %s", exc)
         sys.exit(1)
 
     logger.info("Starting MEXC Market Maker bot…")

@@ -27,11 +27,11 @@ ALLOWED_USER_IDS: set[int] = {
     int(uid.strip()) for uid in _raw_ids.split(",") if uid.strip().isdigit()
 }
 
-# ── Supabase ───────────────────────────────────────────────────────────────────
-# Project URL and anon/service-role key from Supabase dashboard → Settings → API.
-# Use the service-role key (not anon) so the bot can bypass RLS.
-SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY: str = os.getenv("SUPABASE_KEY", "")
+# ── Database ───────────────────────────────────────────────────────────────────
+# Direct PostgreSQL connection string (Supabase pooler recommended for free tier).
+# Format: postgresql://postgres.<project-ref>:<password>@aws-1-<region>.pooler.supabase.com:6543/postgres
+# Set DATABASE_URL in Railway's Variables tab; never commit the real value.
+DATABASE_URL: str = os.getenv("DATABASE_URL", "")
 
 # ── Runtime paths (local fallback only) ───────────────────────────────────────
 # state.json is no longer the primary store; kept for local dev without Supabase.
@@ -95,8 +95,6 @@ def validate_env() -> list[str]:
         missing.append("TELEGRAM_BOT_TOKEN")
     if not ALLOWED_USER_IDS:
         missing.append("ALLOWED_USER_IDS")
-    if not SUPABASE_URL:
-        missing.append("SUPABASE_URL")
-    if not SUPABASE_KEY:
-        missing.append("SUPABASE_KEY")
+    if not DATABASE_URL:
+        missing.append("DATABASE_URL")
     return missing
