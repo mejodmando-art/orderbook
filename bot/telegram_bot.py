@@ -116,9 +116,13 @@ def _risk_kb(symbol: str) -> InlineKeyboardMarkup:
 
 
 def _active_grid_kb(symbol: str) -> InlineKeyboardMarkup:
+    muted = symbol in _muted_symbols
+    mute_label = "🔔 تفعيل الإشعارات" if muted else "🔕 كتم الإشعارات"
+    mute_cb    = f"unmute_{symbol}" if muted else f"mute_{symbol}"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 تفاصيل الربح", callback_data=f"detail_{symbol}"),
          InlineKeyboardButton("🔄 إعادة تشكيل", callback_data=f"rebuild_{symbol}")],
+        [InlineKeyboardButton(mute_label, callback_data=mute_cb)],
         [InlineKeyboardButton("⛔ إيقاف", callback_data=f"stop_{symbol}")],
         [InlineKeyboardButton("🔙 رجوع", callback_data="menu_list")],
     ])
@@ -557,6 +561,18 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception as exc:
             await query.edit_message_text(f"❌ خطأ: {exc}")
 
+    elif data.startswith("mute_"):
+        symbol = data[5:]
+        _muted_symbols.add(symbol)
+        await query.answer("🔕 تم كتم الإشعارات", show_alert=False)
+        await query.edit_message_reply_markup(reply_markup=_active_grid_kb(symbol))
+
+    elif data.startswith("unmute_"):
+        symbol = data[7:]
+        _muted_symbols.discard(symbol)
+        await query.answer("🔔 تم تفعيل الإشعارات", show_alert=False)
+        await query.edit_message_reply_markup(reply_markup=_active_grid_kb(symbol))
+
     elif data.startswith("stop_"):
         symbol = data[5:]
         await query.edit_message_text(f"⚠️ هل تريد إيقاف *{symbol}* وبيع كل الكميات؟", parse_mode="Markdown", reply_markup=_confirm_stop_kb(symbol))
@@ -638,19 +654,232 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
-async def send_notification(text: str, application=None) -> None:
-    if not application or not TELEGRAM_CHAT_ID:
-        logger.info("NOTIFY: %s", text)
+# ── Notification system ────────────────────────────────────────────────────────
+
+# Global application reference — set by build_application()
+_application = None
+
+# Muted symbols: notifications suppressed per-symbol
+_muted_symbols: set[str] = set()
+
+# Dedup cache: (symbol, event_type, key) → last sent timestamp
+import time as _time
+_notif_cache: dict[tuple, float] = {}
+_NOTIF_DEDUP_SECONDS = 5  # ignore duplicate events within this window
+
+
+def _is_muted(symbol: str) -> bool:
+    return symbol in _muted_symbols or "ALL" in _muted_symbols
+
+
+def _dedup_key(symbol: str, event: str, key: str = "") -> bool:
+    """Return True if this event was already sent recently (dedup)."""
+    cache_key = (symbol, event, key)
+    now = _time.monotonic()
+    last = _notif_cache.get(cache_key, 0)
+    if now - last < _NOTIF_DEDUP_SECONDS:
+        return True
+    _notif_cache[cache_key] = now
+    return False
+
+
+async def _send(text: str) -> None:
+    """Low-level fire-and-forget send. Never raises."""
+    if not _application or not TELEGRAM_CHAT_ID:
+        logger.info("NOTIFY: %s", text[:120])
         return
     try:
-        await application.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="Markdown")
+        await _application.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=text,
+            parse_mode="Markdown",
+        )
     except Exception as exc:
-        logger.error("send_notification failed: %s", exc)
+        logger.error("send failed: %s", exc)
+
+
+def _now_str() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+# ── Public notification functions (called from grid_engine) ────────────────────
+
+async def notify_buy_filled(
+    symbol: str,
+    price: float,
+    qty: float,
+    grid_level: int = 0,
+    grid_total: int = 0,
+) -> None:
+    if _is_muted(symbol):
+        return
+    if _dedup_key(symbol, "buy", f"{price:.4f}"):
+        return
+    value = price * qty
+    grid_info = f"\n🔢 الشبكة: `{grid_level}` من `{grid_total}`" if grid_total else ""
+    await _send(
+        f"📥 *تنفيذ شراء*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💱 الزوج: `{symbol}`\n"
+        f"💵 السعر: `{price:,.4f}` USDT\n"
+        f"🪙 الكمية: `{qty:.6f}`\n"
+        f"💰 القيمة: `{value:.2f}` USDT"
+        f"{grid_info}\n"
+        f"🕐 الوقت: `{_now_str()}`"
+    )
+
+
+async def notify_sell_filled(
+    symbol: str,
+    price: float,
+    qty: float,
+    pnl: float,
+) -> None:
+    if _is_muted(symbol):
+        return
+    if _dedup_key(symbol, "sell", f"{price:.4f}"):
+        return
+    value = price * qty
+    pnl_sign = "+" if pnl >= 0 else ""
+    await _send(
+        f"📤 *تنفيذ بيع*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💱 الزوج: `{symbol}`\n"
+        f"💵 السعر: `{price:,.4f}` USDT\n"
+        f"🪙 الكمية: `{qty:.6f}`\n"
+        f"💰 القيمة: `{value:.2f}` USDT\n"
+        f"💹 الربح: `{pnl_sign}{pnl:.4f}` USDT\n"
+        f"🕐 الوقت: `{_now_str()}`"
+    )
+
+
+async def notify_grid_rebuild(
+    symbol: str,
+    reason: str,
+    old_price: float,
+    new_price: float,
+    new_lower: float,
+    new_upper: float,
+    new_grid_count: int,
+    new_atr: float,
+) -> None:
+    if _is_muted(symbol):
+        return
+    await _send(
+        f"🔄 *إعادة تشكيل الشبكة*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💱 الزوج: `{symbol}`\n"
+        f"📌 السبب: {reason}\n"
+        f"📉 السعر القديم: `{old_price:,.4f}`\n"
+        f"📈 السعر الجديد: `{new_price:,.4f}`\n"
+        f"📐 النطاق الجديد: `{new_lower:,.4f}` ←→ `{new_upper:,.4f}`\n"
+        f"🔢 عدد الشبكات: `{new_grid_count}`\n"
+        f"📡 ATR الجديد: `{new_atr:.4f}`\n"
+        f"🕐 الوقت: `{_now_str()}`"
+    )
+
+
+async def notify_grid_expansion(
+    symbol: str,
+    direction: str,
+    new_price: float,
+    order_side: str,
+) -> None:
+    if _is_muted(symbol):
+        return
+    if _dedup_key(symbol, "expand", f"{direction}{new_price:.4f}"):
+        return
+    dir_ar  = "⬆️ أعلى" if direction == "up" else "⬇️ أسفل"
+    side_ar = "شراء 🟢" if order_side == "buy" else "بيع 🔴"
+    await _send(
+        f"➕ *توسيع الشبكة*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💱 الزوج: `{symbol}`\n"
+        f"🧭 الاتجاه: {dir_ar}\n"
+        f"💵 السعر الجديد: `{new_price:,.4f}`\n"
+        f"📋 نوع الأمر: {side_ar}"
+    )
+
+
+async def notify_error(
+    symbol: str,
+    error_type: str,
+    details: str,
+) -> None:
+    if _dedup_key(symbol, "error", error_type):
+        return
+    await _send(
+        f"⚠️ *خطأ في البوت*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💱 الزوج: `{symbol}`\n"
+        f"🔴 نوع الخطأ: {error_type}\n"
+        f"📋 التفاصيل: {details}\n"
+        f"🕐 الوقت: `{_now_str()}`"
+    )
+
+
+async def notify_hourly_report(symbol: str, report: dict) -> None:
+    if _is_muted(symbol):
+        return
+    pnl_sign = "+" if report["total_profit"] >= 0 else ""
+    await _send(
+        f"📊 *تقرير ساعي — {symbol}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ صفقات بيع منفذة: `{report['sell_count']}`\n"
+        f"💹 ربح الشبكة: `+{report['grid_profit']:.4f}` USDT\n"
+        f"📈 أرباح غير محققة: `{report['unrealised_pnl']:.4f}` USDT\n"
+        f"🏆 إجمالي الربح: `{pnl_sign}{report['total_profit']:.4f}` USDT\n"
+        f"📊 APY: `{report['apy']:.2f}%`\n"
+        f"🔓 أوامر مفتوحة: `{report['open_orders']}`"
+    )
+
+
+# ── send_notification (legacy / engine rebuild alerts) ─────────────────────────
+
+async def send_notification(text: str, application=None) -> None:
+    """Generic notification — used by engine for rebuild alerts."""
+    global _application
+    if application:
+        _application = application
+    await _send(text)
+
+
+# ── Mute command ───────────────────────────────────────────────────────────────
+
+async def cmd_mute(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/mute [SYMBOL|ALL] — suppress notifications for a symbol or all."""
+    if not _is_allowed(update):
+        return await _deny(update)
+    target = (ctx.args[0].upper() if ctx.args else "ALL")
+    if "/" not in target and target != "ALL":
+        target = _normalize_symbol(target)
+    _muted_symbols.add(target)
+    await update.message.reply_text(
+        f"🔕 الإشعارات مكتومة لـ `{target}`.\nلإعادة التفعيل: `/unmute {target}`",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/unmute [SYMBOL|ALL] — re-enable notifications."""
+    if not _is_allowed(update):
+        return await _deny(update)
+    target = (ctx.args[0].upper() if ctx.args else "ALL")
+    if "/" not in target and target != "ALL":
+        target = _normalize_symbol(target)
+    _muted_symbols.discard(target)
+    await update.message.reply_text(
+        f"🔔 الإشعارات مفعّلة لـ `{target}`.",
+        parse_mode="Markdown",
+    )
 
 
 def build_application(engine, client) -> Application:
+    global _application
     set_engine(engine, client)
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    _application = app
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("start_ai", cmd_start_ai))
@@ -660,6 +889,8 @@ def build_application(engine, client) -> Application:
     app.add_handler(CommandHandler("pairs", cmd_pairs))
     app.add_handler(CommandHandler("addpair", cmd_addpair))
     app.add_handler(CommandHandler("removepair", cmd_removepair))
+    app.add_handler(CommandHandler("mute", cmd_mute))
+    app.add_handler(CommandHandler("unmute", cmd_unmute))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app

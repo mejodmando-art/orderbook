@@ -9,8 +9,16 @@ import sys
 
 from config.settings import LOG_LEVEL, validate_env
 from core.mexc_client import MexcClient
-from core.grid_engine import GridEngine
-from bot.telegram_bot import build_application, send_notification
+from core.grid_engine import GridEngine, set_notifiers
+from bot.telegram_bot import (
+    build_application,
+    send_notification,
+    notify_buy_filled,
+    notify_sell_filled,
+    notify_grid_rebuild,
+    notify_grid_expansion,
+    notify_error,
+)
 from utils.db_manager import init_db, close_db, get_all_active_grids
 
 logging.basicConfig(
@@ -92,6 +100,16 @@ def main() -> None:
 
     app = build_application(engine, client)
     _notify_ref["app"] = app
+
+    # Wire notification functions into the engine (after app is built
+    # so _application is set inside telegram_bot)
+    set_notifiers(
+        buy_filled    = notify_buy_filled,
+        sell_filled   = notify_sell_filled,
+        grid_rebuild  = notify_grid_rebuild,
+        grid_expansion = notify_grid_expansion,
+        error         = notify_error,
+    )
 
     # Inject shared objects so startup/shutdown hooks can access them
     app.bot_data["client"] = client

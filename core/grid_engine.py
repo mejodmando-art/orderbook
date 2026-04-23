@@ -37,6 +37,40 @@ logger = logging.getLogger(__name__)
 # How many active orders to keep on each side at startup
 INITIAL_ORDERS_PER_SIDE = 2
 
+# Notification functions — injected at runtime to avoid circular import
+_notify_buy_filled    = None
+_notify_sell_filled   = None
+_notify_grid_rebuild  = None
+_notify_grid_expansion = None
+_notify_error         = None
+
+
+def set_notifiers(
+    buy_filled,
+    sell_filled,
+    grid_rebuild,
+    grid_expansion,
+    error,
+) -> None:
+    """Called from main.py after both engine and bot are initialised."""
+    global _notify_buy_filled, _notify_sell_filled
+    global _notify_grid_rebuild, _notify_grid_expansion, _notify_error
+    _notify_buy_filled    = buy_filled
+    _notify_sell_filled   = sell_filled
+    _notify_grid_rebuild  = grid_rebuild
+    _notify_grid_expansion = grid_expansion
+    _notify_error         = error
+
+
+async def _fire(coro_or_none) -> None:
+    """Await a notification coroutine safely — never blocks the engine."""
+    if coro_or_none is None:
+        return
+    try:
+        await coro_or_none
+    except Exception as exc:
+        logger.error("Notification error: %s", exc)
+
 
 # ── ATR (Wilder) ───────────────────────────────────────────────────────────────
 
@@ -252,20 +286,45 @@ class GridEngine:
     # ── Main loop ──────────────────────────────────────────────────────────────
 
     async def _run_loop(self, state: GridState) -> None:
-        last_atr_refresh = asyncio.get_event_loop().time()
+        loop = asyncio.get_event_loop()
+        last_atr_refresh  = loop.time()
+        last_hourly_report = loop.time()
+        HOURLY = 3600
+
         while state.running:
             try:
-                now = asyncio.get_event_loop().time()
+                now = loop.time()
+
+                # ATR rebalance every 5 min
                 if now - last_atr_refresh >= ATR_REFRESH_SECONDS:
                     await self._maybe_rebalance(state)
                     last_atr_refresh = now
+
+                # Hourly summary report
+                if now - last_hourly_report >= HOURLY:
+                    await self._send_hourly_report(state)
+                    last_hourly_report = now
+
                 await self._poll_fills(state)
                 await asyncio.sleep(FILL_POLL_INTERVAL)
+
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 logger.exception("Grid loop error for %s: %s", state.symbol, exc)
+                await _fire(_notify_error and _notify_error(
+                    state.symbol, type(exc).__name__, str(exc)[:200]
+                ))
                 await asyncio.sleep(30)
+
+    async def _send_hourly_report(self, state: GridState) -> None:
+        try:
+            from bot import telegram_bot as tgbot
+            price  = await self._client.get_current_price(state.symbol)
+            report = self.calc_profit_report(state, price)
+            await _fire(tgbot.notify_hourly_report(state.symbol, report))
+        except Exception as exc:
+            logger.error("Hourly report error for %s: %s", state.symbol, exc)
 
     # ── ATR rebalance ──────────────────────────────────────────────────────────
 
@@ -277,12 +336,25 @@ class GridEngine:
         outside = price < state.params.lower - trigger or price > state.params.upper + trigger
 
         if outside:
-            logger.info("Price %.4f escaped range — rebuilding grid for %s", price, state.symbol)
-            await self._notify(
-                f"🔄 *{state.symbol}* — السعر خرج عن النطاق. إعادة بناء الشبكة…\n"
-                f"السعر: `{price:.4f}` | ATR: `{atr:.4f}`"
+            reason = (
+                "السعر تجاوز النطاق العلوي"
+                if price > state.params.upper + trigger
+                else "السعر تجاوز النطاق السفلي"
             )
+            old_lower = state.params.lower
+            old_upper = state.params.upper
+            logger.info("Price %.4f escaped range — rebuilding grid for %s", price, state.symbol)
             await self._rebuild(state, price, atr)
+            await _fire(_notify_grid_rebuild and _notify_grid_rebuild(
+                state.symbol,
+                reason,
+                price,
+                price,
+                state.params.lower,
+                state.params.upper,
+                state.params.grid_count,
+                atr,
+            ))
         else:
             state.params.atr = atr
             await db.upsert_grid({"symbol": state.symbol, "current_atr": atr})
@@ -334,6 +406,10 @@ class GridEngine:
             state.avg_buy_price = total_cost / state.held_qty if state.held_qty else 0.0
             await db.record_trade(state.symbol, "buy", fill_price, qty, order.get("id",""), state.grid_id, 0.0)
             await self._sync_pnl(state)
+            await _fire(_notify_buy_filled and _notify_buy_filled(
+                state.symbol, fill_price, qty,
+                grid_level=0, grid_total=state.params.grid_count,
+            ))
             return
 
         if side == "buy":
@@ -354,6 +430,16 @@ class GridEngine:
                 buy_order = await self._client.place_limit_buy(state.symbol, next_buy_price, state.params.qty_per_grid)
                 if buy_order:
                     state.open_orders[buy_order["id"]] = {"side": "buy", "price": next_buy_price, "qty": state.params.qty_per_grid}
+                    await _fire(_notify_grid_expansion and _notify_grid_expansion(
+                        state.symbol, "down", next_buy_price, "buy"
+                    ))
+
+            # Notify buy fill
+            await _fire(_notify_buy_filled and _notify_buy_filled(
+                state.symbol, fill_price, qty,
+                grid_level=len(state.open_orders),
+                grid_total=state.params.grid_count,
+            ))
 
         else:  # sell
             pnl              = (fill_price - state.avg_buy_price) * qty
@@ -374,6 +460,14 @@ class GridEngine:
                 sell_order = await self._client.place_limit_sell(state.symbol, next_sell_price, state.params.qty_per_grid)
                 if sell_order:
                     state.open_orders[sell_order["id"]] = {"side": "sell", "price": next_sell_price, "qty": state.params.qty_per_grid}
+                    await _fire(_notify_grid_expansion and _notify_grid_expansion(
+                        state.symbol, "up", next_sell_price, "sell"
+                    ))
+
+            # Notify sell fill
+            await _fire(_notify_sell_filled and _notify_sell_filled(
+                state.symbol, fill_price, qty, pnl
+            ))
 
         await db.record_trade(state.symbol, side, fill_price, qty, order.get("id",""), state.grid_id, pnl)
         await self._sync_pnl(state)
