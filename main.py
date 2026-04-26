@@ -21,10 +21,14 @@ from bot.telegram_bot import (
 )
 from utils.db_manager import init_db, close_db, get_all_active_grids
 from super_consensus.core.consensus_engine import ConsensusEngine
+from super_consensus.core.auto_trade_engine import AutoTradeEngine
+from super_consensus.bot.menu_bot import register_menu_handlers
 from super_consensus.utils.super_db import (
     init_super_db,
     close_super_db,
     get_all_active_bots,
+    get_auto_settings,
+    get_auto_positions,
     make_db_fns,
     upsert_bot,
 )
@@ -136,12 +140,36 @@ async def _on_startup(application) -> None:
             except Exception as exc:
                 logger.error("Failed to recover SuperConsensus bot %s: %s", symbol, exc)
 
+    # ── Recover AutoTradeEngine ────────────────────────────────────────────────
+    auto_engine: AutoTradeEngine = application.bot_data["auto_engine"]
+    auto_recovered = False
+    auto_positions_count = 0
+    try:
+        auto_settings = await get_auto_settings()
+        auto_positions = await get_auto_positions()
+        auto_positions_count = len(auto_positions)
+        if auto_settings:
+            await auto_engine.restore_from_db(auto_settings, auto_positions)
+            auto_recovered = bool(auto_settings.get("is_active", False))
+            logger.info(
+                "AutoTradeEngine restored: active=%s positions=%d",
+                auto_recovered, auto_positions_count,
+            )
+    except Exception as exc:
+        logger.error("Failed to restore AutoTradeEngine: %s", exc)
+
     # ── Startup notification ───────────────────────────────────────────────────
+    auto_line = (
+        f"🤖 الوضع الآلي: مُستعاد ✅ ({auto_positions_count} صفقة مفتوحة)"
+        if auto_recovered
+        else "🤖 الوضع الآلي: موقوف — فعّله بـ /menu"
+    )
     await send_notification(
         "🤖 *AI Grid Bot* — تم التشغيل بنجاح!\n"
         f"📊 شبكات مستردة: `{recovered}` | مُرقَّاة: `{upgraded}` | فشلت: `{failed}`\n"
         f"🧠 *SuperConsensus* — بوتات مستردة: `{super_recovered}`\n"
-        "اكتب /start للقائمة الرئيسية | /super\\_menu للإجماع.",
+        f"{auto_line}\n"
+        "اكتب /menu للقائمة التفاعلية | /super\\_menu للإجماع.",
         application=application,
     )
     logger.info("Startup complete. Grids=%d SuperBots=%d", recovered, super_recovered)
@@ -169,6 +197,11 @@ async def _on_shutdown(application) -> None:
             except Exception as exc:
                 logger.error("Error stopping SuperConsensus bot %s: %s", symbol, exc)
 
+    # Stop AutoTradeEngine background tasks (positions persist in DB)
+    auto_engine: AutoTradeEngine = application.bot_data.get("auto_engine")
+    if auto_engine:
+        await auto_engine.disable()
+
     await client.close()
     await close_db()
     await close_super_db()
@@ -193,9 +226,16 @@ def main() -> None:
     # SuperConsensus engine — same notify channel
     super_engine = ConsensusEngine(client=client, notify=notify)
 
+    # AutoTrade engine — same notify channel
+    auto_engine = AutoTradeEngine(client=client, notify=notify)
+
     # Build single Application with both sets of handlers
     app = build_application(engine, client, super_engine=super_engine)
     _notify_ref["app"] = app
+
+    # Register interactive /menu handlers
+    app.bot_data["auto_engine"] = auto_engine
+    register_menu_handlers(app)
 
     # Wire grid notification callbacks
     set_notifiers(
@@ -210,6 +250,7 @@ def main() -> None:
     app.bot_data["client"]       = client
     app.bot_data["engine"]       = engine
     app.bot_data["super_engine"] = super_engine
+    app.bot_data["auto_engine"]  = auto_engine
 
     app.post_init     = _on_startup
     app.post_shutdown = _on_shutdown
