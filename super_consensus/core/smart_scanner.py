@@ -41,31 +41,24 @@ SCAN_COIN_COUNT = 50          # how many top coins to fetch from CoinGecko
 SCAN_TOP_PICKS  = 5           # each analyst picks this many coins
 SCAN_FINAL_TOP  = 3           # judge outputs this many final coins
 
-# Free models — ordered by reliability (confirmed in production).
-# GPT-OSS-20B and Gemma4-26B are confirmed working.
-# Using 3 different providers to spread rate-limit load.
-ANALYST_MODELS: List[Tuple[str, str]] = [
-    ("GPT-OSS-20B", "openai/gpt-oss-20b:free"),          # ✅ confirmed
-    ("Gemma4-26B",  "google/gemma-4-26b-a4b-it:free"),   # ✅ confirmed
-    ("Gemma4-31B",  "google/gemma-4-31b-it:free"),        # same provider, larger
-]
-JUDGE_MODEL = "openai/gpt-oss-120b:free"                  # ✅ confirmed
+# Single reliable model used for all 3 analyst perspectives.
+# Free-tier models from other providers are too rate-limited to be dependable.
+# GPT-OSS-20B is the only model confirmed stable across multiple runs.
+ANALYST_MODEL = "openai/gpt-oss-20b:free"
+JUDGE_MODEL   = "openai/gpt-oss-120b:free"
 
-# Fallback pool — tried one-for-one if a primary fails
-FALLBACK_ANALYST_MODELS: List[Tuple[str, str]] = [
-    ("LLaMA-3B",    "meta-llama/llama-3.2-3b-instruct:free"),
-    ("Hermes-405B", "nousresearch/hermes-3-llama-3.1-405b:free"),
-    ("LLaMA-70B",   "meta-llama/llama-3.3-70b-instruct:free"),
+# 3 analyst perspectives — same model, different analytical lens
+ANALYST_PERSPECTIVES: List[Tuple[str, str]] = [
+    ("Momentum",    "Focus on price momentum: 24h and 7d price change, volume trends. Pick coins with the strongest upward momentum."),
+    ("Value",       "Focus on value metrics: volume-to-market-cap ratio, market cap size. Pick undervalued coins with high trading activity relative to their size."),
+    ("Breakout",    "Focus on breakout signals: coins showing unusual volume spikes or price acceleration in the last 24h compared to their 7d trend."),
 ]
 
-# Send analysts sequentially with a gap to avoid simultaneous 429s
-ANALYST_DELAY_SECONDS = 5   # wait between each analyst call
+# Delay between analyst calls (same model — needs breathing room)
+ANALYST_DELAY_SECONDS = 8
 
 # Max coins to include in the AI prompt (pre-filtered by data quality)
 PROMPT_COIN_LIMIT = 20
-
-# Minimum successful analysts needed before calling the judge
-MIN_SUCCESSFUL_ANALYSTS = 1
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_HEADERS = {
@@ -389,33 +382,30 @@ def _prefilter_coins(coins: List[CoinData], limit: int = PROMPT_COIN_LIMIT) -> L
     return ranked[:limit]
 
 
-_ANALYST_SYSTEM = (
-    "You are a crypto trading analyst. "
-    "Respond with ONLY a valid JSON array. No markdown, no text outside the JSON."
-)
-
-def _build_analyst_prompt(coins: List[CoinData], top_n: int) -> str:
+def _build_analyst_prompt(coins: List[CoinData], top_n: int, perspective: str) -> str:
     coin_lines = "\n".join(c.summary_line() for c in coins)
     return (
-        f"Pick the TOP {top_n} best BUY opportunities from this list.\n\n"
+        f"Analytical focus: {perspective}\n\n"
+        f"Pick the TOP {top_n} coins from this list using ONLY the focus above.\n\n"
         f"{coin_lines}\n\n"
         f"Reply with ONLY this JSON (no other text):\n"
         f'[{{"symbol":"BTC","name":"Bitcoin","signal":"BUY","confidence":75,'
-        f'"reason":"one sentence"}}, ...]\n'
+        f'"reason":"one specific sentence based on the data"}}, ...]\n'
         f"Exactly {top_n} items. signal=BUY/SELL/HOLD, confidence=0-100."
     )
 
 
 async def _run_analyst(
     analyst_name: str,
-    model: str,
+    perspective: str,
     coins: List[CoinData],
 ) -> AnalystReport:
     filtered = _prefilter_coins(coins, PROMPT_COIN_LIMIT)
-    prompt   = _build_analyst_prompt(filtered, SCAN_TOP_PICKS)
+    prompt   = _build_analyst_prompt(filtered, SCAN_TOP_PICKS, perspective)
+    system   = "You are a crypto trading analyst. Respond with ONLY a valid JSON array. No markdown, no text outside the JSON."
     try:
         raw = await asyncio.get_event_loop().run_in_executor(
-            None, _call_openrouter, model, _ANALYST_SYSTEM, prompt, 500
+            None, _call_openrouter, ANALYST_MODEL, system, prompt, 500
         )
         logger.debug("Analyst %s raw: %s", analyst_name, raw[:300])
 
@@ -430,11 +420,11 @@ async def _run_analyst(
                 reason=str(item.get("reason", "")),
             ))
         logger.info("Analyst %s picked: %s", analyst_name, [p.symbol for p in picks])
-        return AnalystReport(analyst_name=analyst_name, model=model, picks=picks)
+        return AnalystReport(analyst_name=analyst_name, model=ANALYST_MODEL, picks=picks)
 
     except Exception as exc:
         logger.error("Analyst %s failed: %s", analyst_name, exc)
-        return AnalystReport(analyst_name=analyst_name, model=model, error=str(exc))
+        return AnalystReport(analyst_name=analyst_name, model=ANALYST_MODEL, error=str(exc))
 
 
 # ── Consensus merge ────────────────────────────────────────────────────────────
@@ -586,36 +576,18 @@ class SmartScanner:
 
         logger.info("SmartScanner: got %d coins (after filtering stablecoins)", len(coins))
 
-        # 2. Run analysts sequentially with a delay between each.
-        # If a primary analyst fails, try a fallback model in its slot.
+        # 2. Run 3 analyst perspectives sequentially on the same model.
+        # Using one reliable model (GPT-OSS-20B) with different analytical
+        # lenses instead of multiple unreliable free-tier models.
         reports: List[AnalystReport] = []
-        fallback_iter = iter(FALLBACK_ANALYST_MODELS)
-
-        for i, (name, model) in enumerate(ANALYST_MODELS):
+        for i, (name, perspective) in enumerate(ANALYST_PERSPECTIVES):
             if i > 0:
                 await asyncio.sleep(ANALYST_DELAY_SECONDS)
-            report = await _run_analyst(name, model, coins)
-
-            # If primary failed, try one fallback in its place
-            if report.error:
-                try:
-                    fb_name, fb_model = next(fallback_iter)
-                    logger.info(
-                        "Primary analyst %s failed — trying fallback %s", name, fb_name
-                    )
-                    await asyncio.sleep(2)
-                    fb_report = await _run_analyst(fb_name, fb_model, coins)
-                    if not fb_report.error:
-                        report = fb_report
-                except StopIteration:
-                    pass  # no more fallbacks
-
+            report = await _run_analyst(name, perspective, coins)
             reports.append(report)
 
         successful = sum(1 for r in reports if not r.error)
-        logger.info(
-            "SmartScanner: %d/%d analysts succeeded", successful, len(reports)
-        )
+        logger.info("SmartScanner: %d/%d perspectives succeeded", successful, len(reports))
 
         # 3. Merge results
         merged = _merge_analyst_reports(reports)
