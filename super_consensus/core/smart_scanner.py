@@ -41,13 +41,13 @@ SCAN_COIN_COUNT = 50          # how many top coins to fetch from CoinGecko
 SCAN_TOP_PICKS  = 5           # each analyst picks this many coins
 SCAN_FINAL_TOP  = 3           # judge outputs this many final coins
 
-# Free models — ordered by reliability for structured JSON output
+# Free models — verified available on OpenRouter (checked 2025-04-26)
 ANALYST_MODELS: List[Tuple[str, str]] = [
-    ("Nemotron",  "nvidia/nemotron-3-super-120b-a12b:free"),
-    ("LLaMA-70B", "meta-llama/llama-3.3-70b-instruct:free"),
-    ("Qwen3-235B","qwen/qwen3-235b-a22b:free"),
+    ("LLaMA-70B",  "meta-llama/llama-3.3-70b-instruct:free"),
+    ("Gemma-27B",  "google/gemma-3-27b-it:free"),
+    ("Hermes-405B","nousresearch/hermes-3-llama-3.1-405b:free"),
 ]
-JUDGE_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
+JUDGE_MODEL = "openai/gpt-oss-120b:free"
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_HEADERS = {
@@ -258,7 +258,10 @@ def _fetch_top_coins(count: int = SCAN_COIN_COUNT) -> List[CoinData]:
 
 # ── OpenRouter call (sync, runs in thread) ─────────────────────────────────────
 
-def _call_openrouter(model: str, system: str, user: str, max_tokens: int = 800) -> str:
+def _call_openrouter(
+    model: str, system: str, user: str,
+    max_tokens: int = 800, retries: int = 2
+) -> str:
     if not OPENROUTER_API_KEY:
         raise RuntimeError("OPENROUTER_API_KEY not set")
 
@@ -273,29 +276,81 @@ def _call_openrouter(model: str, system: str, user: str, max_tokens: int = 800) 
     }).encode()
 
     headers = {**OPENROUTER_HEADERS, "Authorization": f"Bearer {OPENROUTER_API_KEY}"}
-    req = urllib.request.Request(OPENROUTER_URL, data=payload, headers=headers, method="POST")
 
-    with urllib.request.urlopen(req, timeout=60) as r:
-        data = json.loads(r.read())
+    last_exc: Exception = RuntimeError("No attempts")
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(
+                OPENROUTER_URL, data=payload, headers=headers, method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=90) as r:
+                data = json.loads(r.read())
 
-    return data["choices"][0]["message"]["content"].strip()
+            content = data["choices"][0]["message"]["content"]
+            if not content or not content.strip():
+                raise ValueError(f"Model {model} returned empty content")
+            return content.strip()
+
+        except urllib.error.HTTPError as exc:
+            last_exc = exc
+            body = ""
+            try:
+                body = exc.read().decode()[:200]
+            except Exception:
+                pass
+            if exc.code == 429:
+                wait = 15 * attempt
+                logger.warning("OpenRouter 429 [%s] — waiting %ds (attempt %d/%d)", model, wait, attempt, retries)
+                time.sleep(wait)
+            elif exc.code in (502, 503, 504):
+                logger.warning("OpenRouter %d [%s] — retrying (attempt %d/%d)", exc.code, model, attempt, retries)
+                time.sleep(5)
+            else:
+                raise RuntimeError(f"HTTP {exc.code} from OpenRouter [{model}]: {body}") from exc
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(3)
+
+    raise last_exc
 
 
 def _extract_json_array(text: str) -> list:
-    """Extract the first JSON array from a text response."""
-    match = re.search(r"\[.*?\]", text, re.DOTALL)
-    if match:
-        return json.loads(match.group())
-    # Fallback: try the whole text
-    return json.loads(text)
+    """
+    Extract the first JSON array from a model response.
+    Handles markdown code fences, leading text, and partial responses.
+    """
+    if not text or not text.strip():
+        raise ValueError("Empty response from model")
 
+    # Strip markdown code fences
+    text = re.sub(r"```(?:json)?", "", text).strip()
 
-def _extract_json_object(text: str) -> dict:
-    """Extract the first JSON object from a text response."""
-    match = re.search(r"\{.*?\}", text, re.DOTALL)
-    if match:
-        return json.loads(match.group())
-    return json.loads(text)
+    # Try direct parse first
+    try:
+        result = json.loads(text)
+        if isinstance(result, list):
+            return result
+    except json.JSONDecodeError:
+        pass
+
+    # Find the outermost [...] block (handles nested objects inside)
+    depth = 0
+    start = None
+    for i, ch in enumerate(text):
+        if ch == "[":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0 and start is not None:
+                try:
+                    return json.loads(text[start:i + 1])
+                except json.JSONDecodeError:
+                    pass
+
+    raise ValueError(f"No valid JSON array found in response (first 200 chars): {text[:200]}")
 
 
 # ── Analyst prompt & parsing ───────────────────────────────────────────────────
