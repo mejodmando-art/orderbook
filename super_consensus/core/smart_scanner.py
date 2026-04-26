@@ -41,21 +41,21 @@ SCAN_COIN_COUNT = 50          # how many top coins to fetch from CoinGecko
 SCAN_TOP_PICKS  = 5           # each analyst picks this many coins
 SCAN_FINAL_TOP  = 3           # judge outputs this many final coins
 
-# Free models — ordered by reliability. All from different providers to
-# spread rate-limit load. GPT-OSS-20B confirmed working; others are fallbacks.
-# Primary analysts: try each in order, skip on failure
+# Free models — ordered by reliability (confirmed in production).
+# GPT-OSS-20B and Gemma4-26B are confirmed working.
+# Using 3 different providers to spread rate-limit load.
 ANALYST_MODELS: List[Tuple[str, str]] = [
-    ("GPT-OSS-20B",  "openai/gpt-oss-20b:free"),
-    ("Qwen3-80B",    "qwen/qwen3-next-80b-a3b-instruct:free"),
-    ("Nemotron-30B", "nvidia/nemotron-3-nano-30b-a3b:free"),
+    ("GPT-OSS-20B", "openai/gpt-oss-20b:free"),          # ✅ confirmed
+    ("Gemma4-26B",  "google/gemma-4-26b-a4b-it:free"),   # ✅ confirmed
+    ("Gemma4-31B",  "google/gemma-4-31b-it:free"),        # same provider, larger
 ]
-JUDGE_MODEL = "openai/gpt-oss-120b:free"
+JUDGE_MODEL = "openai/gpt-oss-120b:free"                  # ✅ confirmed
 
-# Fallback analysts tried if primary ones all fail
+# Fallback pool — tried one-for-one if a primary fails
 FALLBACK_ANALYST_MODELS: List[Tuple[str, str]] = [
     ("LLaMA-3B",    "meta-llama/llama-3.2-3b-instruct:free"),
-    ("Gemma4-26B",  "google/gemma-4-26b-a4b-it:free"),
     ("Hermes-405B", "nousresearch/hermes-3-llama-3.1-405b:free"),
+    ("LLaMA-70B",   "meta-llama/llama-3.3-70b-instruct:free"),
 ]
 
 # Send analysts sequentially with a gap to avoid simultaneous 429s
