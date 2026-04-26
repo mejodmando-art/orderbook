@@ -21,6 +21,7 @@ from telegram.constants import ParseMode
 
 from config.settings import ALLOWED_USER_IDS
 from super_consensus.core.consensus_engine import ConsensusEngine, BotState, CONFIDENCE_THRESHOLD
+from super_consensus.core.smart_scanner import SMART_SCANNER, ScanResult, SCAN_COIN_COUNT
 from super_consensus.utils.super_db import upsert_bot, deactivate_bot, make_db_fns
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,9 @@ def _main_menu_kb() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("👑 حالة العمالقة", callback_data="super:giants"),
             InlineKeyboardButton("📋 قائمة البوتات", callback_data="super:list"),
+        ],
+        [
+            InlineKeyboardButton("🔍 مسح السوق /scan", callback_data="super:scan"),
         ],
     ])
 
@@ -403,9 +407,17 @@ async def handle_super_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
         "signals": "لعرض الإشارات:\n`/signals BTCUSDT`",
         "giants":  "لعرض حالة العمالقة:\n`/giants BTCUSDT`",
         "list":    None,
+        "scan":    None,
     }
 
-    if action == "list":
+    if action == "scan":
+        # Trigger the scan directly from the inline button
+        await query.message.reply_text(
+            "🔍 استخدم الأمر `/scan` لبدء مسح السوق الذكي.\n"
+            "يمكنك تحديد عدد العملات: `/scan 50`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    elif action == "list":
         engine: ConsensusEngine = ctx.bot_data["super_engine"]
         symbols = engine.active_symbols()
         text = (
@@ -415,6 +427,102 @@ async def handle_super_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
         await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     elif action in hints:
         await query.message.reply_text(hints[action], parse_mode=ParseMode.MARKDOWN)
+
+
+# ── /scan — Smart Market Scanner ──────────────────────────────────────────────
+
+def _signal_emoji(sig: str) -> str:
+    return {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪"}.get(sig.upper(), "⚪")
+
+
+def _build_scan_report(result: ScanResult) -> str:
+    """Format ScanResult into a Telegram-ready Markdown message."""
+    lines = [
+        "🔍 *تقرير الماسح الذكي — Smart Scanner*",
+        f"📊 عملات تم فحصها: `{result.coins_scanned}`",
+        f"⏱️ وقت التحليل: `{result.scan_duration_s:.0f}` ثانية",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+        "🏆 *أفضل الفرص (قرار القاضي النهائي)*",
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+    for pick in result.final_picks:
+        medal = medals[pick.rank - 1] if pick.rank <= len(medals) else f"{pick.rank}."
+        sig_e = _signal_emoji(pick.signal)
+        analysts_str = " & ".join(pick.analysts) if pick.analysts else "—"
+        conf_bar = "█" * round(pick.confidence / 10) + "░" * (10 - round(pick.confidence / 10))
+        lines += [
+            "",
+            f"{medal} *{pick.name}* (`{pick.symbol}`)",
+            f"  {sig_e} الإشارة: `{pick.signal}` | الثقة: `{conf_bar}` {pick.confidence}%",
+            f"  💬 _{pick.reason}_",
+            f"  👥 اتفق عليها: `{analysts_str}`",
+        ]
+
+    # Analyst summaries
+    lines += [
+        "",
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+        "🧠 *تقارير المحللين الثلاثة*",
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    for report in result.analyst_reports:
+        if report.error:
+            lines.append(f"  ⚠️ *{report.analyst_name}*: خطأ — `{report.error[:60]}`")
+            continue
+        picks_str = ", ".join(
+            f"{p.symbol}({p.confidence}%)" for p in report.picks
+        )
+        lines.append(f"  🤖 *{report.analyst_name}*: {picks_str}")
+
+    lines += [
+        "",
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+        "⚠️ _هذا تحليل AI للمعلومات فقط — ليس نصيحة مالية._",
+    ]
+    return "\n".join(lines)
+
+
+async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /scan [count]
+    Runs the Smart Scanner: fetches top coins, runs 3 AI analysts + judge,
+    and returns the best opportunities.
+    """
+    if not _authorized(update):
+        return await _deny(update)
+
+    # Optional coin count argument
+    count = SCAN_COIN_COUNT
+    if ctx.args:
+        try:
+            count = max(10, min(100, int(ctx.args[0])))
+        except ValueError:
+            pass
+
+    wait_msg = await update.message.reply_text(
+        f"🔍 *الماسح الذكي يعمل...*\n\n"
+        f"📊 جاري فحص أكبر `{count}` عملة من حيث القيمة السوقية\n"
+        f"🤖 يتم استشارة 3 نماذج AI بالتوازي\n"
+        f"⏳ _قد يستغرق 30-90 ثانية..._",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    try:
+        result = await SMART_SCANNER.scan(coin_count=count)
+        report = _build_scan_report(result)
+        await wait_msg.delete()
+        await update.message.reply_text(report, parse_mode=ParseMode.MARKDOWN)
+
+    except Exception as exc:
+        logger.error("cmd_scan error: %s", exc, exc_info=True)
+        await wait_msg.delete()
+        await update.message.reply_text(
+            f"❌ *خطأ في الماسح الذكي*\n`{exc}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
 
 # ── Registration ───────────────────────────────────────────────────────────────
@@ -432,6 +540,7 @@ def register_super_handlers(app: Application, engine: ConsensusEngine) -> None:
     app.add_handler(CommandHandler("list_super",   cmd_list_super))
     app.add_handler(CommandHandler("pause_super",  cmd_pause_super))
     app.add_handler(CommandHandler("resume_super", cmd_resume_super))
+    app.add_handler(CommandHandler("scan",         cmd_scan))
     app.add_handler(CallbackQueryHandler(handle_super_callback, pattern=r"^super:"))
 
-    logger.info("SuperConsensus handlers registered (AI-powered)")
+    logger.info("SuperConsensus handlers registered (AI-powered + SmartScanner)")
