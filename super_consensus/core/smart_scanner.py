@@ -42,12 +42,19 @@ SCAN_TOP_PICKS  = 5           # each analyst picks this many coins
 SCAN_FINAL_TOP  = 3           # judge outputs this many final coins
 
 # Free models — verified available on OpenRouter (checked 2025-04-26)
+# Using diverse providers to spread rate-limit load
 ANALYST_MODELS: List[Tuple[str, str]] = [
     ("LLaMA-70B",  "meta-llama/llama-3.3-70b-instruct:free"),
-    ("Gemma-27B",  "google/gemma-3-27b-it:free"),
-    ("Hermes-405B","nousresearch/hermes-3-llama-3.1-405b:free"),
+    ("Gemma-12B",  "google/gemma-3-12b-it:free"),        # smaller → no 400
+    ("GPT-OSS-20B","openai/gpt-oss-20b:free"),           # different provider
 ]
 JUDGE_MODEL = "openai/gpt-oss-120b:free"
+
+# Send analysts sequentially with a gap to avoid simultaneous 429s
+ANALYST_DELAY_SECONDS = 3   # wait between each analyst call
+
+# Max coins to include in the AI prompt (pre-filtered by data quality)
+PROMPT_COIN_LIMIT = 20
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_HEADERS = {
@@ -74,6 +81,8 @@ COINPAPRIKA_TICKERS_URL = "https://api.coinpaprika.com/v1/tickers?limit={count}"
 STABLECOINS = {
     "usdt", "usdc", "busd", "dai", "tusd", "usdp", "usdd",
     "frax", "lusd", "susd", "gusd", "fdusd", "pyusd",
+    "usd1", "usde", "usds", "crvusd", "mkr", "xaut", "paxg",
+    "wbtc", "steth", "weth", "cbbtc",  # wrapped/staked assets
 }
 
 
@@ -355,24 +364,34 @@ def _extract_json_array(text: str) -> list:
 
 # ── Analyst prompt & parsing ───────────────────────────────────────────────────
 
+def _prefilter_coins(coins: List[CoinData], limit: int = PROMPT_COIN_LIMIT) -> List[CoinData]:
+    """
+    Reduce the coin list before sending to AI to keep prompts short.
+    Scores each coin by volume/mcap ratio and 24h momentum, keeps top `limit`.
+    """
+    def score(c: CoinData) -> float:
+        vol_ratio = (c.volume_24h / c.market_cap) if c.market_cap > 0 else 0
+        momentum  = c.change_24h + (c.change_7d * 0.3)
+        return vol_ratio * 100 + momentum
+
+    ranked = sorted(coins, key=score, reverse=True)
+    return ranked[:limit]
+
+
 _ANALYST_SYSTEM = (
-    "You are a professional cryptocurrency market analyst. "
-    "You analyze market data and identify the best trading opportunities. "
-    "Always respond with ONLY a valid JSON array — no markdown, no explanation outside JSON."
+    "You are a crypto trading analyst. "
+    "Respond with ONLY a valid JSON array. No markdown, no text outside the JSON."
 )
 
 def _build_analyst_prompt(coins: List[CoinData], top_n: int) -> str:
     coin_lines = "\n".join(c.summary_line() for c in coins)
     return (
-        f"Analyze the following {len(coins)} cryptocurrencies and select the TOP {top_n} "
-        f"best BUY opportunities right now based on market data.\n\n"
-        f"Market Data:\n{coin_lines}\n\n"
-        f"Selection criteria: strong volume, positive momentum, reasonable market cap, "
-        f"good 24h/7d performance relative to peers.\n\n"
-        f"Respond with ONLY a JSON array of exactly {top_n} objects:\n"
+        f"Pick the TOP {top_n} best BUY opportunities from this list.\n\n"
+        f"{coin_lines}\n\n"
+        f"Reply with ONLY this JSON (no other text):\n"
         f'[{{"symbol":"BTC","name":"Bitcoin","signal":"BUY","confidence":75,'
-        f'"reason":"one clear sentence"}}, ...]\n\n'
-        f"signal must be BUY, SELL, or HOLD. confidence is 0-100."
+        f'"reason":"one sentence"}}, ...]\n'
+        f"Exactly {top_n} items. signal=BUY/SELL/HOLD, confidence=0-100."
     )
 
 
@@ -381,10 +400,11 @@ async def _run_analyst(
     model: str,
     coins: List[CoinData],
 ) -> AnalystReport:
-    prompt = _build_analyst_prompt(coins, SCAN_TOP_PICKS)
+    filtered = _prefilter_coins(coins, PROMPT_COIN_LIMIT)
+    prompt   = _build_analyst_prompt(filtered, SCAN_TOP_PICKS)
     try:
         raw = await asyncio.get_event_loop().run_in_executor(
-            None, _call_openrouter, model, _ANALYST_SYSTEM, prompt, 600
+            None, _call_openrouter, model, _ANALYST_SYSTEM, prompt, 500
         )
         logger.debug("Analyst %s raw: %s", analyst_name, raw[:300])
 
@@ -559,12 +579,14 @@ class SmartScanner:
 
         logger.info("SmartScanner: got %d coins (after filtering stablecoins)", len(coins))
 
-        # 2. Run 3 analysts in parallel
-        analyst_tasks = [
-            _run_analyst(name, model, coins)
-            for name, model in ANALYST_MODELS
-        ]
-        reports: List[AnalystReport] = await asyncio.gather(*analyst_tasks)
+        # 2. Run analysts sequentially with a small delay between each
+        # to avoid simultaneous 429s from OpenRouter
+        reports: List[AnalystReport] = []
+        for i, (name, model) in enumerate(ANALYST_MODELS):
+            if i > 0:
+                await asyncio.sleep(ANALYST_DELAY_SECONDS)
+            report = await _run_analyst(name, model, coins)
+            reports.append(report)
 
         # 3. Merge results
         merged = _merge_analyst_reports(reports)
