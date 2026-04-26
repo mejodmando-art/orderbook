@@ -97,6 +97,7 @@ async def _on_startup(application) -> None:
         f"🤖 *SuperConsensus Bot* — تم التشغيل!\n"
         f"📊 بوتات مستردة: `{recovered}`\n"
         f"👑 العمالقة: `{', '.join(g.name for g in GIANTS)}`\n"
+        f"🔍 الماسح الذكي: جاهز — اكتب /scan لمسح السوق\n"
         "اكتب /super\\_menu للقائمة الرئيسية.",
         application=application,
     )
