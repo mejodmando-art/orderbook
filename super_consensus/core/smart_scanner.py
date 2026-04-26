@@ -474,10 +474,11 @@ def _merge_analyst_reports(reports: List[AnalystReport]) -> Dict[str, dict]:
 # ── Judge prompt & parsing ─────────────────────────────────────────────────────
 
 _JUDGE_SYSTEM = (
-    "You are the chief crypto trading judge. "
-    "You receive analysis reports from multiple AI analysts and must synthesize them "
-    "into a final ranked list of the best trading opportunities. "
-    "Always respond with ONLY a valid JSON array — no markdown, no explanation outside JSON."
+    "You are a crypto trading judge. "
+    "Synthesize analyst reports into a final ranked list. "
+    "The 'reason' field must explain WHY the coin is a good opportunity "
+    "(price action, volume, momentum, fundamentals) — NOT describe the voting process. "
+    "Respond with ONLY a valid JSON array. No markdown, no text outside JSON."
 )
 
 def _build_judge_prompt(
@@ -485,37 +486,32 @@ def _build_judge_prompt(
     merged: Dict[str, dict],
     final_n: int,
 ) -> str:
-    # Analyst summaries
-    analyst_blocks = []
-    for r in reports:
-        if r.error:
-            analyst_blocks.append(f"[{r.analyst_name}] ERROR: {r.error}")
-            continue
-        picks_str = ", ".join(
-            f"{p.symbol}({p.signal},{p.confidence}%)" for p in r.picks
+    # Build per-coin analyst reasons
+    coin_blocks = []
+    for sym, data in sorted(merged.items(), key=lambda x: (-x[1]["votes"], -x[1]["confidence"])):
+        reasons = data.get("reasons", [])
+        reasons_str = " | ".join(reasons) if reasons else "no reason given"
+        coin_blocks.append(
+            f"{sym} ({data['name']}): {data['votes']} analysts agree, "
+            f"avg {data['confidence']}% confidence\n"
+            f"  Reasons: {reasons_str}"
         )
-        analyst_blocks.append(f"[{r.analyst_name}] Picks: {picks_str}")
 
-    # Consensus summary
-    consensus_lines = []
-    for sym, data in sorted(merged.items(), key=lambda x: -x[1]["votes"]):
-        consensus_lines.append(
-            f"  {sym} ({data['name']}): {data['votes']} votes, "
-            f"avg confidence {data['confidence']}%, "
-            f"analysts: {', '.join(data['analysts'])}"
-        )
+    # Failed analysts
+    failed = [r.analyst_name for r in reports if r.error]
+    failed_note = f"Note: {', '.join(failed)} failed and provided no data.\n\n" if failed else ""
 
     return (
-        f"Three AI analysts have reviewed the crypto market. Here are their reports:\n\n"
-        + "\n".join(analyst_blocks)
-        + f"\n\nConsensus Summary (coins appearing in multiple lists):\n"
-        + "\n".join(consensus_lines or ["No consensus found"])
-        + f"\n\nBased on all reports and consensus, select the FINAL TOP {final_n} "
-        f"best opportunities. Prioritize coins with multiple analyst agreement.\n\n"
+        f"{failed_note}"
+        f"Analyst picks with reasons:\n"
+        + "\n".join(coin_blocks[:15])  # cap to avoid prompt bloat
+        + f"\n\nSelect the FINAL TOP {final_n} best opportunities. "
+        f"Write a specific market reason for each (price action, volume, momentum). "
+        f"Do NOT say 'highest consensus' or describe the voting — explain the market.\n\n"
         f"Respond with ONLY a JSON array of exactly {final_n} objects:\n"
         f'[{{"rank":1,"symbol":"BTC","name":"Bitcoin","signal":"BUY","confidence":80,'
-        f'"reason":"one clear unified reason","analysts":["Nemotron","LLaMA-70B"]}}, ...]\n\n'
-        f"rank is 1 (best) to {final_n}. signal must be BUY, SELL, or HOLD."
+        f'"reason":"specific market reason here","analysts":["Analyst1","Analyst2"]}}, ...]\n'
+        f"rank 1=best. signal=BUY/SELL/HOLD."
     )
 
 
