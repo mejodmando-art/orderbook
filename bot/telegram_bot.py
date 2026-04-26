@@ -999,10 +999,10 @@ def build_application(engine, client, super_engine=None) -> Application:
     from super_consensus.bot.menu_bot import register_menu_handlers
     register_menu_handlers(app)
 
-    # ── Catch-all: only grid/super callbacks (menu: auto: set: profit: stop: handled above)
+    # ── Catch-all: only legacy grid/super callbacks (new menu patterns handled above)
     app.add_handler(CallbackQueryHandler(
         handle_callback,
-        pattern=r"^(?!menu:|auto:|set:|profit:|stop:)",
+        pattern=r"^(?!menu:|auto:|set:|profit:|stop:|grid:|gridrisk:|gridstop:|super:)",
     ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app

@@ -28,14 +28,21 @@ logger = logging.getLogger(__name__)
 
 # ── Conversation states ────────────────────────────────────────────────────────
 (
-    AWAIT_CUSTOM_AMOUNT,   # waiting for custom USDT amount in auto mode
-    AWAIT_STOP_LOSS,       # waiting for stop-loss %
-    AWAIT_TAKE_PROFIT,     # waiting for take-profit %
-    AWAIT_MAX_TRADES,      # waiting for max open trades
-    AWAIT_SCAN_INTERVAL,   # waiting for scan interval minutes
-    AWAIT_TRADE_AMOUNT,    # waiting for fixed trade amount
-    AWAIT_COIN_COUNT,      # waiting for coin count to scan
-) = range(7)
+    AWAIT_CUSTOM_AMOUNT,    # custom USDT amount for auto mode
+    AWAIT_STOP_LOSS,        # stop-loss %
+    AWAIT_TAKE_PROFIT,      # take-profit %
+    AWAIT_MAX_TRADES,       # max open trades
+    AWAIT_SCAN_INTERVAL,    # scan interval minutes
+    AWAIT_TRADE_AMOUNT,     # fixed trade amount
+    AWAIT_COIN_COUNT,       # coin count to scan
+    AWAIT_GRID_PAIR,        # grid bot: trading pair
+    AWAIT_GRID_AMOUNT,      # grid bot: investment amount
+    AWAIT_SCAN_AUTO_MIN,    # super consensus: auto-scan interval minutes
+) = range(10)
+
+# Popular pairs for quick selection
+POPULAR_PAIRS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
+                 "DOGE/USDT", "ADA/USDT", "AVAX/USDT", "DOT/USDT", "MATIC/USDT"]
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
 
@@ -58,12 +65,15 @@ async def _deny(update: Update) -> None:
 
 def _kb_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔍 مسح السوق الآن",       callback_data="menu:scan")],
-        [InlineKeyboardButton("🤖 تفعيل الوضع الآلي",    callback_data="menu:auto_mode")],
-        [InlineKeyboardButton("⏹️ إيقاف الوضع الآلي",    callback_data="menu:auto_stop")],
-        [InlineKeyboardButton("📊 حالة البوت والصفقات",  callback_data="menu:status")],
-        [InlineKeyboardButton("⚙️ الإعدادات",            callback_data="menu:settings")],
-        [InlineKeyboardButton("📈 تقرير الأرباح",        callback_data="menu:profit")],
+        [InlineKeyboardButton("🤖 شبكة AI الذكية (Grid Bot)",       callback_data="menu:grid")],
+        [InlineKeyboardButton("🧠 إجماع الخارق (SuperConsensus)",   callback_data="menu:super")],
+        [InlineKeyboardButton("⚡ تداول آلي كامل (Auto-Trade)",     callback_data="menu:auto_mode")],
+        [InlineKeyboardButton("🔍 مسح السوق الآن",                  callback_data="menu:scan")],
+        [
+            InlineKeyboardButton("📊 الحالة",      callback_data="menu:status"),
+            InlineKeyboardButton("⚙️ الإعدادات",  callback_data="menu:settings"),
+        ],
+        [InlineKeyboardButton("📈 تقرير الأرباح", callback_data="menu:profit")],
     ])
 
 
@@ -130,6 +140,79 @@ def _kb_back() -> InlineKeyboardMarkup:
     ]])
 
 
+def _kb_grid_pairs() -> InlineKeyboardMarkup:
+    """Quick pair selection for Grid Bot."""
+    rows = []
+    for i in range(0, len(POPULAR_PAIRS), 2):
+        row = []
+        for pair in POPULAR_PAIRS[i:i+2]:
+            base = pair.replace("/USDT", "")
+            row.append(InlineKeyboardButton(base, callback_data=f"grid:{pair}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton("✏️ زوج مخصص", callback_data="grid:custom")])
+    rows.append([InlineKeyboardButton("🔙 رجوع",      callback_data="menu:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _kb_grid_risk() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🟢 منخفض",  callback_data="gridrisk:low"),
+            InlineKeyboardButton("🟡 متوسط",  callback_data="gridrisk:medium"),
+            InlineKeyboardButton("🔴 مرتفع",  callback_data="gridrisk:high"),
+        ],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="menu:grid")],
+    ])
+
+
+def _kb_grid_menu(has_last: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🚀 تشغيل شبكة جديدة",  callback_data="grid:new")],
+    ]
+    if has_last:
+        rows.append([InlineKeyboardButton("⚡ تشغيل بآخر إعدادات", callback_data="grid:last")])
+    rows.append([InlineKeyboardButton("🛑 إيقاف شبكة",            callback_data="grid:stop_menu")])
+    rows.append([InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="menu:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _kb_super_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔍 مسح يدوي الآن",        callback_data="super:scan_now")],
+        [InlineKeyboardButton("⏱️ مسح تلقائي دوري",      callback_data="super:scan_auto")],
+        [InlineKeyboardButton("📋 آخر تقرير مسح",        callback_data="super:last_report")],
+        [InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="menu:back")],
+    ])
+
+
+def _kb_auto_trade_menu(auto_engine) -> InlineKeyboardMarkup:
+    """Auto-Trade menu with current TP/SL shown on buttons."""
+    s = auto_engine.settings if auto_engine else None
+    tp  = s.take_profit_pct if s else 3.0
+    sl  = s.stop_loss_pct   if s else 2.0
+    active = auto_engine and auto_engine.is_active()
+    rows = [
+        [
+            InlineKeyboardButton("💵 50",   callback_data="auto:50"),
+            InlineKeyboardButton("💵 100",  callback_data="auto:100"),
+            InlineKeyboardButton("💵 200",  callback_data="auto:200"),
+        ],
+        [
+            InlineKeyboardButton("💵 500",  callback_data="auto:500"),
+            InlineKeyboardButton("💵 1000", callback_data="auto:1000"),
+            InlineKeyboardButton("✏️ مخصص", callback_data="auto:custom"),
+        ],
+        [
+            InlineKeyboardButton(f"🎯 TP: {tp}%",  callback_data="set:take_profit"),
+            InlineKeyboardButton(f"🛑 SL: {sl}%",  callback_data="set:stop_loss"),
+        ],
+    ]
+    if active:
+        rows.append([InlineKeyboardButton("⏹️ إيقاف التداول الآلي", callback_data="menu:auto_stop")])
+    rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="menu:back")])
+    return InlineKeyboardMarkup(rows)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Helper: edit or send
 # ══════════════════════════════════════════════════════════════════════════════
@@ -180,12 +263,40 @@ async def _cb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[i
         )
         return ConversationHandler.END
 
+    if action == "grid":
+        has_last = bool(ctx.user_data.get("grid_last_pair"))
+        last_info = ""
+        if has_last:
+            lp = ctx.user_data.get("grid_last_pair", "")
+            la = ctx.user_data.get("grid_last_amount", 0)
+            lr = ctx.user_data.get("grid_last_risk", "medium")
+            last_info = f"\n⚡ آخر إعدادات: `{lp}` | `{la} USDT` | `{lr}`"
+        await _edit(query,
+            f"🤖 *شبكة AI الذكية — Grid Bot*{last_info}\n\n"
+            "اختر ما تريد:",
+            _kb_grid_menu(has_last=has_last),
+        )
+        return None
+
+    if action == "super":
+        await _edit(query,
+            "🧠 *إجماع الخارق — SuperConsensus*\n\n"
+            "يحلل السوق بـ 3 نماذج AI ويجد أفضل الفرص.\n\n"
+            "اختر وضع التشغيل:",
+            _kb_super_menu(),
+        )
+        return None
+
     if action == "auto_mode":
         active_str = "🟢 *الوضع الآلي مفعّل حالياً*\n\n" if auto and auto.is_active() else ""
+        s = auto.settings if auto else None
+        tp = s.take_profit_pct if s else 3.0
+        sl = s.stop_loss_pct   if s else 2.0
         await _edit(query,
-            f"{active_str}🤖 *تفعيل الوضع الآلي*\n\n"
+            f"{active_str}⚡ *تداول آلي كامل — Auto-Trade*\n\n"
+            f"🎯 هدف الربح: `+{tp}%` | 🛑 وقف الخسارة: `-{sl}%`\n\n"
             "اختر مبلغ كل صفقة بـ USDT:",
-            _kb_auto_mode(),
+            _kb_auto_trade_menu(auto),
         )
         return None
 
@@ -263,7 +374,7 @@ async def _cb_auto(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[i
 
     s = auto.settings if auto else None
     await _edit(query,
-        f"✅ *الوضع الآلي مُفعَّل*\n\n"
+        f"✅ *التداول الآلي مُفعَّل*\n\n"
         f"💵 مبلغ كل صفقة: `{amount:.0f} USDT`\n"
         f"🎯 هدف الربح: `+{s.take_profit_pct if s else 3}%`\n"
         f"🛡️ وقف الخسارة: `-{s.stop_loss_pct if s else 2}%`\n"
@@ -319,6 +430,230 @@ async def _cb_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "_(تُراقَب حتى تُغلق بـ TP/SL/timeout)_",
             _kb_main(),
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# grid: callbacks — Grid Bot flow
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _cb_grid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+
+    if action == "new":
+        await _edit(query,
+            "🤖 *شبكة جديدة — اختر الزوج*\n\n"
+            "اضغط على زوج أو اختر 'مخصص' لإدخال أي زوج:",
+            _kb_grid_pairs(),
+        )
+        return None
+
+    if action == "last":
+        pair   = ctx.user_data.get("grid_last_pair")
+        amount = ctx.user_data.get("grid_last_amount")
+        risk   = ctx.user_data.get("grid_last_risk", "medium")
+        if not pair or not amount:
+            await query.answer("لا توجد إعدادات سابقة.", show_alert=True)
+            return None
+        await _launch_grid(query, ctx, pair, amount, risk)
+        return None
+
+    if action == "custom":
+        await _edit(query,
+            "✏️ *زوج مخصص*\n\nأرسل رمز الزوج (مثال: `SOLUSDT` أو `SOL/USDT`):",
+            _kb_back(),
+        )
+        ctx.user_data["grid_step"] = "pair"
+        return AWAIT_GRID_PAIR
+
+    if action == "stop_menu":
+        engine = ctx.bot_data.get("engine")
+        if not engine:
+            await query.answer("محرك الشبكة غير متاح.", show_alert=True)
+            return None
+        symbols = engine.active_symbols() if engine else []
+        if not symbols:
+            await query.answer("لا توجد شبكات نشطة.", show_alert=True)
+            return None
+        rows = [[InlineKeyboardButton(f"🛑 {s}", callback_data=f"gridstop:{s}")] for s in symbols]
+        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="menu:grid")])
+        await _edit(query, "🛑 *اختر الشبكة للإيقاف:*", InlineKeyboardMarkup(rows))
+        return None
+
+    # Pair selected from quick list (e.g. "BTC/USDT")
+    if "/" in action or action.endswith("USDT"):
+        pair = action if "/" in action else action.replace("USDT", "/USDT")
+        ctx.user_data["grid_pending_pair"] = pair
+        await _edit(query,
+            f"💵 *المبلغ — {pair}*\n\nأرسل مبلغ الاستثمار بـ USDT (مثال: `100`):",
+            _kb_back(),
+        )
+        ctx.user_data["grid_step"] = "amount"
+        return AWAIT_GRID_AMOUNT
+
+    return None
+
+
+async def _cb_gridrisk(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Risk level selected — launch the grid."""
+    query = update.callback_query
+    await query.answer()
+    risk = query.data.split(":")[1]
+    pair   = ctx.user_data.get("grid_pending_pair", "")
+    amount = ctx.user_data.get("grid_pending_amount", 0)
+    if not pair or not amount:
+        await query.answer("بيانات ناقصة، ابدأ من جديد.", show_alert=True)
+        return
+    await _launch_grid(query, ctx, pair, amount, risk)
+
+
+async def _cb_gridstop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stop a specific grid."""
+    query = update.callback_query
+    await query.answer()
+    symbol = query.data.split(":", 1)[1]
+    engine = ctx.bot_data.get("engine")
+    if not engine:
+        await query.answer("محرك الشبكة غير متاح.", show_alert=True)
+        return
+    try:
+        pnl = await engine.stop(symbol, market_sell=True)
+        pnl_str = f"`{pnl:+.2f} USDT`" if pnl is not None else "غير محدد"
+        await _edit(query,
+            f"🛑 *تم إيقاف شبكة `{symbol}`*\n\n💰 الربح/الخسارة: {pnl_str}",
+            _kb_main(),
+        )
+    except Exception as exc:
+        await _edit(query, f"❌ خطأ في الإيقاف: `{exc}`", _kb_back())
+
+
+async def _launch_grid(query, ctx, pair: str, amount: float, risk: str) -> None:
+    """Execute grid start and show result."""
+    engine = ctx.bot_data.get("engine")
+    if not engine:
+        await _edit(query, "❌ محرك الشبكة غير متاح.", _kb_back())
+        return
+    risk_labels = {"low": "🟢 منخفض", "medium": "🟡 متوسط", "high": "🔴 مرتفع"}
+    try:
+        await _edit(query, f"⏳ جاري تشغيل شبكة `{pair}`...", _kb_back())
+        await engine.start(symbol=pair, total_investment=amount, risk=risk)
+        # Save as last settings
+        ctx.user_data["grid_last_pair"]   = pair
+        ctx.user_data["grid_last_amount"] = amount
+        ctx.user_data["grid_last_risk"]   = risk
+        await _edit(query,
+            f"✅ *شبكة AI مُشغَّلة*\n\n"
+            f"🪙 الزوج: `{pair}`\n"
+            f"💵 الاستثمار: `{amount:.0f} USDT`\n"
+            f"⚖️ المخاطرة: {risk_labels.get(risk, risk)}\n\n"
+            "البوت يعمل الآن ويضع أوامر الشراء والبيع تلقائياً.",
+            _kb_main(),
+        )
+    except Exception as exc:
+        await _edit(query, f"❌ فشل تشغيل الشبكة: `{exc}`", _kb_back())
+
+
+async def _recv_grid_pair(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _authorized(update):
+        return ConversationHandler.END
+    raw  = (update.message.text or "").strip().upper()
+    pair = raw if "/" in raw else raw.replace("USDT", "/USDT")
+    if not pair.endswith("/USDT"):
+        pair += "/USDT"
+    ctx.user_data["grid_pending_pair"] = pair
+    ctx.user_data["grid_step"] = "amount"
+    await update.message.reply_text(
+        f"💵 *المبلغ — {pair}*\n\nأرسل مبلغ الاستثمار بـ USDT (مثال: `100`):",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return AWAIT_GRID_AMOUNT
+
+
+async def _recv_grid_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _authorized(update):
+        return ConversationHandler.END
+    text = (update.message.text or "").strip()
+    try:
+        amount = float(text)
+        assert amount > 0
+    except (ValueError, AssertionError):
+        await update.message.reply_text("❌ أدخل رقماً موجباً (مثال: `100`)", parse_mode=ParseMode.MARKDOWN)
+        return AWAIT_GRID_AMOUNT
+
+    ctx.user_data["grid_pending_amount"] = amount
+    pair = ctx.user_data.get("grid_pending_pair", "")
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🟢 منخفض",  callback_data="gridrisk:low"),
+        InlineKeyboardButton("🟡 متوسط",  callback_data="gridrisk:medium"),
+        InlineKeyboardButton("🔴 مرتفع",  callback_data="gridrisk:high"),
+    ]])
+    await update.message.reply_text(
+        f"⚖️ *مستوى المخاطرة — {pair} | {amount:.0f} USDT*\n\nاختر مستوى المخاطرة:",
+        reply_markup=kb,
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return ConversationHandler.END
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# super: callbacks — SuperConsensus flow
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _cb_super(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":")[1]
+
+    if action == "scan_now":
+        await _do_scan(query, ctx)
+        return None
+
+    if action == "scan_auto":
+        await _edit(query,
+            "⏱️ *مسح تلقائي دوري*\n\n"
+            "أرسل الفترة بالدقائق (مثال: `60` = كل ساعة):",
+            _kb_back(),
+        )
+        ctx.user_data["setting_action"] = "scan_interval"
+        return AWAIT_SCAN_AUTO_MIN
+
+    if action == "last_report":
+        last = ctx.bot_data.get("last_scan_report")
+        if not last:
+            await query.answer("لا يوجد تقرير مسح سابق بعد. اضغط 'مسح يدوي' أولاً.", show_alert=True)
+            return None
+        # Send as new message (may be long)
+        await query.message.reply_text(last, parse_mode=ParseMode.MARKDOWN)
+        return None
+
+    return None
+
+
+async def _recv_scan_auto_min(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _authorized(update):
+        return ConversationHandler.END
+    text = (update.message.text or "").strip()
+    try:
+        minutes = int(text)
+        assert 5 <= minutes <= 1440
+    except (ValueError, AssertionError):
+        await update.message.reply_text("❌ أدخل عدد دقائق بين 5 و 1440.", parse_mode=ParseMode.MARKDOWN)
+        return AWAIT_SCAN_AUTO_MIN
+
+    auto = ctx.bot_data.get("auto_engine")
+    if auto:
+        auto.settings.scan_interval_min = minutes
+        from super_consensus.utils.super_db import upsert_auto_settings
+        await upsert_auto_settings(auto._settings_dict())
+
+    await update.message.reply_text(
+        f"✅ *المسح التلقائي مُفعَّل*\n\n"
+        f"⏱️ سيتم مسح السوق كل `{minutes}` دقيقة\n\n"
+        "اكتب /menu للعودة للقائمة.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return ConversationHandler.END
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -463,16 +798,15 @@ async def _do_scan(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         result = await SMART_SCANNER.scan()
         report = _build_scan_report(result)
+        # Cache for "آخر تقرير" button
+        ctx.bot_data["last_scan_report"] = report
         # Send as new message (too long to edit) then restore menu
         await query.message.reply_text(report, parse_mode=ParseMode.MARKDOWN)
-        auto = ctx.bot_data.get("auto_engine")
+        auto   = ctx.bot_data.get("auto_engine")
         status = "🟢 مفعّل" if auto and auto.is_active() else "🔴 موقوف"
         open_c = len(auto.open_positions()) if auto else 0
         await query.message.reply_text(
-            "🤖 *القائمة الرئيسية — SuperConsensus Bot*\n\n"
-            f"الوضع الآلي: {status}\n"
-            f"صفقات مفتوحة: `{open_c}`\n\n"
-            "اختر من القائمة:",
+            f"🤖 *القائمة الرئيسية*\n\nالوضع الآلي: {status} | صفقات: `{open_c}`\n\nاختر:",
             reply_markup=_kb_main(),
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -542,23 +876,25 @@ async def _show_status(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 def register_menu_handlers(app: Application) -> None:
     """Register /menu command and all inline-keyboard handlers."""
 
-    # States map for ConversationHandler
-    setting_states = {
-        AWAIT_STOP_LOSS:    [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_setting)],
-        AWAIT_TAKE_PROFIT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_setting)],
-        AWAIT_MAX_TRADES:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_setting)],
-        AWAIT_SCAN_INTERVAL:[MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_setting)],
-        AWAIT_TRADE_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_setting)],
-        AWAIT_COIN_COUNT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_setting)],
-        AWAIT_CUSTOM_AMOUNT:[MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_custom_amount)],
-    }
-
     conv = ConversationHandler(
         entry_points=[
-            CallbackQueryHandler(_cb_set,  pattern=r"^set:"),
-            CallbackQueryHandler(_cb_auto, pattern=r"^auto:"),
+            CallbackQueryHandler(_cb_set,   pattern=r"^set:"),
+            CallbackQueryHandler(_cb_auto,  pattern=r"^auto:custom$"),
+            CallbackQueryHandler(_cb_grid,  pattern=r"^grid:(new|custom|[A-Z]+/USDT)$"),
+            CallbackQueryHandler(_cb_super, pattern=r"^super:scan_auto$"),
         ],
-        states=setting_states,
+        states={
+            AWAIT_CUSTOM_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_custom_amount)],
+            AWAIT_STOP_LOSS:     [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_setting)],
+            AWAIT_TAKE_PROFIT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_setting)],
+            AWAIT_MAX_TRADES:    [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_setting)],
+            AWAIT_SCAN_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_setting)],
+            AWAIT_TRADE_AMOUNT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_setting)],
+            AWAIT_COIN_COUNT:    [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_setting)],
+            AWAIT_GRID_PAIR:     [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_grid_pair)],
+            AWAIT_GRID_AMOUNT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_grid_amount)],
+            AWAIT_SCAN_AUTO_MIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_scan_auto_min)],
+        },
         fallbacks=[
             CommandHandler("menu", cmd_menu),
             CallbackQueryHandler(_cb_menu, pattern=r"^menu:"),
@@ -568,10 +904,14 @@ def register_menu_handlers(app: Application) -> None:
 
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(conv)
-    app.add_handler(CallbackQueryHandler(_cb_menu,   pattern=r"^menu:"))
-    app.add_handler(CallbackQueryHandler(_cb_auto,   pattern=r"^auto:"))
-    app.add_handler(CallbackQueryHandler(_cb_stop,   pattern=r"^stop:"))
-    app.add_handler(CallbackQueryHandler(_cb_profit, pattern=r"^profit:"))
+    app.add_handler(CallbackQueryHandler(_cb_menu,     pattern=r"^menu:"))
+    app.add_handler(CallbackQueryHandler(_cb_auto,     pattern=r"^auto:"))
+    app.add_handler(CallbackQueryHandler(_cb_stop,     pattern=r"^stop:"))
+    app.add_handler(CallbackQueryHandler(_cb_profit,   pattern=r"^profit:"))
+    app.add_handler(CallbackQueryHandler(_cb_grid,     pattern=r"^grid:"))
+    app.add_handler(CallbackQueryHandler(_cb_gridrisk, pattern=r"^gridrisk:"))
+    app.add_handler(CallbackQueryHandler(_cb_gridstop, pattern=r"^gridstop:"))
+    app.add_handler(CallbackQueryHandler(_cb_super,    pattern=r"^super:"))
 
-    logger.info("Menu handlers registered (/menu + inline keyboards)")
+    logger.info("Menu handlers registered (/menu + Grid + SuperConsensus + AutoTrade)")
 
