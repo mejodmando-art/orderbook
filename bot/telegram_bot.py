@@ -179,7 +179,7 @@ def _fmt_report(r: dict) -> str:
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(update):
         return await _deny(update)
-    from super_consensus.bot.menu_bot import _kb_main, _main_menu_text
+    from bot.menu_bot import _kb_main, _main_menu_text
     await update.message.reply_text(
         _main_menu_text(ctx),
         parse_mode="Markdown",
@@ -427,7 +427,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     data = query.data
 
     if data == "menu_main":
-        from super_consensus.bot.menu_bot import _kb_main, _main_menu_text
+        from bot.menu_bot import _kb_main, _main_menu_text
         await query.edit_message_text(
             _main_menu_text(ctx),
             parse_mode="Markdown",
@@ -921,7 +921,7 @@ async def cmd_upgrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
 
 
-def build_application(engine, client, super_engine=None) -> Application:
+def build_application(engine, client) -> Application:
     global _application
     set_engine(engine, client)
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -942,19 +942,14 @@ def build_application(engine, client, super_engine=None) -> Application:
     app.add_handler(CommandHandler("upgrade", cmd_upgrade))
     app.add_handler(CommandHandler("balance", cmd_balance))
 
-    # ── SuperConsensus handlers (registered if engine provided) ───────────────
-    if super_engine is not None:
-        from super_consensus.bot.super_bot import register_super_handlers
-        register_super_handlers(app, super_engine)
-
-    # ── Interactive menu handlers (before catch-all) ───────────────────────────
-    from super_consensus.bot.menu_bot import register_menu_handlers
+    # ── Interactive menu handlers ──────────────────────────────────────────────
+    from bot.menu_bot import register_menu_handlers
     register_menu_handlers(app)
 
-    # ── Catch-all: only legacy grid/super callbacks (new menu patterns handled above)
+    # ── Catch-all legacy grid callbacks ───────────────────────────────────────
     app.add_handler(CallbackQueryHandler(
         handle_callback,
-        pattern=r"^(?!menu:|auto:|set:|profit:|stop:|grid:|gridrisk:|gridstop:|super:)",
+        pattern=r"^(?!menu:|profit:|stop:|grid:|gridrisk:|gridstop:)",
     ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app
