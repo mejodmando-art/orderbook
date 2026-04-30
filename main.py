@@ -125,7 +125,9 @@ async def _on_shutdown(application) -> None:
 
     for symbol in list(snr_engine.active_symbols()):
         try:
-            await snr_engine.stop(symbol, market_sell=False)
+            # persist=False keeps is_active=TRUE in DB so the strategy
+            # is restored automatically on the next startup.
+            await snr_engine.stop(symbol, market_sell=False, persist=False)
         except Exception as exc:
             logger.error("Error stopping S&R %s: %s", symbol, exc)
 

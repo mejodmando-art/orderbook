@@ -171,9 +171,12 @@ def compute_sr_levels(
     supports    = _rank(raw_supports,    "support")
     resistances = _rank(raw_resistances, "resistance")
 
-    # 5. Fallback if not enough levels found
+    # 5. Progressive fallback when not enough levels found
+    #    Pass 1: relax distance filter to half
+    #    Pass 2: reduce pivot window (3 bars each side)
+    #    Pass 3: reduce pivot window further (2 bars each side)
+    #    Pass 4: last resort — use recent high/low percentiles
     if len(supports) < num_levels or len(resistances) < num_levels:
-        # Relax distance filter to half and retry
         half_dist = min_dist / 2
         if len(supports) < num_levels:
             extra = _rank(
@@ -189,6 +192,53 @@ def compute_sr_levels(
                 "resistance",
             )
             resistances = (resistances + extra)[:num_levels]
+
+    # Pass 2 & 3: smaller pivot windows
+    for reduced_pivot in (3, 2):
+        if len(supports) >= num_levels and len(resistances) >= num_levels:
+            break
+        half_dist = min_dist / 2
+        if len(supports) < num_levels:
+            extra = _rank(
+                [p for p in _find_swing_lows(lows, reduced_pivot, reduced_pivot)
+                 if p < current_price - half_dist and p not in supports],
+                "support",
+            )
+            supports = list(dict.fromkeys(supports + extra))[:num_levels]
+        if len(resistances) < num_levels:
+            extra = _rank(
+                [p for p in _find_swing_highs(highs, reduced_pivot, reduced_pivot)
+                 if p > current_price + half_dist and p not in resistances],
+                "resistance",
+            )
+            resistances = list(dict.fromkeys(resistances + extra))[:num_levels]
+
+    # Pass 4: percentile-based levels as last resort
+    if len(supports) < num_levels or len(resistances) < num_levels:
+        logger.info(
+            "Using percentile fallback for %s on %s (sup=%d res=%d)",
+            symbol, timeframe, len(supports), len(resistances),
+        )
+        # Use the lowest N lows and highest N highs from the lookback window
+        # as approximate support/resistance anchors.
+        sorted_lows  = sorted(set(lows.tolist()))
+        sorted_highs = sorted(set(highs.tolist()), reverse=True)
+
+        if len(supports) < num_levels:
+            candidates = [p for p in sorted_lows if p < current_price * 0.999]
+            for p in candidates:
+                if p not in supports:
+                    supports.append(p)
+                if len(supports) >= num_levels:
+                    break
+
+        if len(resistances) < num_levels:
+            candidates = [p for p in sorted_highs if p > current_price * 1.001]
+            for p in candidates:
+                if p not in resistances:
+                    resistances.append(p)
+                if len(resistances) >= num_levels:
+                    break
 
     if len(supports) < num_levels or len(resistances) < num_levels:
         logger.warning(
