@@ -36,12 +36,13 @@ ALLOWED_USER_IDS: set[int] = (
 ORDER_SLEEP_SECONDS: float = 0.25   # pause between REST calls to respect rate limits
 FILL_POLL_INTERVAL: int = 10        # seconds between fill-check cycles
 
-# ── S/R detection (LuxAlgo Liquidity Grabs / Bull-Bear Wick method) ───────────
-SR_LOOKBACK_CANDLES:  int   = 300    # candles fetched per S/R computation
-SR_WICK_BODY_RATIO:   float = float(os.getenv("SR_WICK_BODY_RATIO",   "2.0")) # wick must be ≥ N× body to qualify
-SR_MERGE_THRESHOLD:   float = float(os.getenv("SR_MERGE_THRESHOLD",   "1.0")) # merge levels within 1% of each other
-SR_MIN_DISTANCE_PCT:  float = float(os.getenv("SR_MIN_DISTANCE_PCT",  "0.5")) # min % distance from current price
-SR_TOUCH_ZONE_PCT:    float = float(os.getenv("SR_TOUCH_ZONE_PCT",    "0.5")) # % zone around level to count as touch
+# ── S/R detection (swing high/low — matches LuxAlgo S&R Channels) ─────────────
+SR_LOOKBACK_CANDLES: int   = 300
+SR_PIVOT_LEFT:       int   = int(os.getenv("SR_PIVOT_LEFT",       "5"))   # bars left  of swing point
+SR_PIVOT_RIGHT:      int   = int(os.getenv("SR_PIVOT_RIGHT",      "5"))   # bars right of swing point
+SR_MERGE_THRESHOLD:  float = float(os.getenv("SR_MERGE_THRESHOLD", "0.5")) # merge levels within 0.5%
+SR_MIN_DISTANCE_PCT: float = float(os.getenv("SR_MIN_DISTANCE_PCT","0.2")) # min % distance from current price
+SR_TOUCH_ZONE_PCT:   float = float(os.getenv("SR_TOUCH_ZONE_PCT",  "0.3")) # % zone to count as a touch
 
 
 

@@ -1,36 +1,24 @@
 """
-Support & Resistance level detection — LuxAlgo Liquidity Grabs method.
+Support & Resistance level detection.
 
-Matches the "Support & Resistance Channels" indicator (LuxAlgo PAC):
+Matches the LuxAlgo "Support & Resistance Channels" indicator:
 
-  Bull Wick  → Support level
-    A candle whose lower wick is significantly longer than its body.
-    The wick shows price swept liquidity below then reversed upward.
-    Level = candle low.
+  Resistance (red lines)  = swing highs: local price peaks
+  Support    (blue lines) = swing lows:  local price troughs
 
-  Bear Wick  → Resistance level
-    A candle whose upper wick is significantly longer than its body.
-    The wick shows price swept liquidity above then reversed downward.
-    Level = candle high.
+A swing high at index i: high[i] is the highest in a window of
+  SR_PIVOT_LEFT bars to the left and SR_PIVOT_RIGHT bars to the right.
+A swing low  at index i: low[i]  is the lowest  in the same window.
 
-Detection parameters:
-  SR_WICK_BODY_RATIO  — minimum ratio of wick-length / body-length to
-                        qualify as a liquidity grab (default 2.0 = wick
-                        must be at least 2× the body size).
-  SR_MIN_BODY_PCT     — minimum body size as % of candle range to filter
-                        out doji candles (default 0.1%).
-  SR_MERGE_THRESHOLD  — merge levels within this % of each other.
-  SR_MIN_DISTANCE_PCT — discard levels closer than this % to current price.
-  SR_LOOKBACK_CANDLES — number of candles to analyse.
+The level value is the exact high/low of that candle — matching the
+horizontal lines drawn by the indicator.
 
-Scoring:
-  Each level is scored by how many subsequent candles returned to test it
-  (low/high within SR_TOUCH_ZONE_PCT of the level).
-  Unbroken levels (price never closed through them) rank above broken ones.
-
-Output:
-  supports    — sorted descending  (S1 = nearest below price)
-  resistances — sorted ascending   (R1 = nearest above price)
+Levels are then:
+  1. Merged if within SR_MERGE_THRESHOLD % of each other.
+  2. Filtered: must be at least SR_MIN_DISTANCE_PCT % away from price.
+  3. Ranked: unbroken levels (price never closed through them) first,
+     then by number of times price returned to test the level.
+  4. Sorted by proximity: S1 = nearest below, R1 = nearest above.
 """
 from __future__ import annotations
 
@@ -42,6 +30,8 @@ import numpy as np
 
 from config.settings import (
     SR_LOOKBACK_CANDLES,
+    SR_PIVOT_LEFT,
+    SR_PIVOT_RIGHT,
     SR_MERGE_THRESHOLD,
     SR_MIN_DISTANCE_PCT,
     SR_TOUCH_ZONE_PCT,
@@ -51,11 +41,6 @@ from core.mexc_client import MexcClient
 logger = logging.getLogger(__name__)
 
 VALID_TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d", "1w"]
-
-# Wick-to-body ratio threshold — wick must be this many times the body
-SR_WICK_BODY_RATIO: float = 2.0
-# Minimum body size as % of total candle range (filters doji candles)
-SR_MIN_BODY_PCT: float = 0.05
 
 
 @dataclass
@@ -67,77 +52,38 @@ class SRLevels:
     symbol:        str
 
 
-# ── Liquidity grab detection ───────────────────────────────────────────────────
+# ── Swing detection ────────────────────────────────────────────────────────────
 
-def _detect_bull_wicks(
-    opens: np.ndarray,
-    highs: np.ndarray,
-    lows:  np.ndarray,
-    closes: np.ndarray,
-    wick_body_ratio: float,
-    min_body_pct: float,
-) -> list[float]:
-    """
-    Detect Bull Wick candles and return their low prices as support levels.
-
-    Bull Wick: lower_wick >= wick_body_ratio * body  AND  body >= min_body_pct * range
-    lower_wick = min(open, close) - low
-    body       = abs(close - open)
-    range      = high - low
-    """
+def _find_swing_highs(highs: np.ndarray, left: int, right: int) -> list[float]:
+    """Return high values at swing-high candles."""
+    n = len(highs)
     levels = []
-    for i in range(len(opens)):
-        body       = abs(closes[i] - opens[i])
-        candle_rng = highs[i] - lows[i]
-        if candle_rng == 0:
-            continue
-        lower_wick = min(opens[i], closes[i]) - lows[i]
-        # Body must be meaningful (not a doji)
-        if body < min_body_pct / 100 * candle_rng:
-            continue
-        if lower_wick >= wick_body_ratio * body:
-            levels.append(float(lows[i]))
-    return levels
-
-
-def _detect_bear_wicks(
-    opens: np.ndarray,
-    highs: np.ndarray,
-    lows:  np.ndarray,
-    closes: np.ndarray,
-    wick_body_ratio: float,
-    min_body_pct: float,
-) -> list[float]:
-    """
-    Detect Bear Wick candles and return their high prices as resistance levels.
-
-    Bear Wick: upper_wick >= wick_body_ratio * body  AND  body >= min_body_pct * range
-    upper_wick = high - max(open, close)
-    body       = abs(close - open)
-    range      = high - low
-    """
-    levels = []
-    for i in range(len(opens)):
-        body       = abs(closes[i] - opens[i])
-        candle_rng = highs[i] - lows[i]
-        if candle_rng == 0:
-            continue
-        upper_wick = highs[i] - max(opens[i], closes[i])
-        if body < min_body_pct / 100 * candle_rng:
-            continue
-        if upper_wick >= wick_body_ratio * body:
+    for i in range(left, n - right):
+        window = highs[i - left: i + right + 1]
+        if highs[i] == window.max() and np.sum(window == highs[i]) == 1:
             levels.append(float(highs[i]))
     return levels
 
 
-# ── Touch scoring ──────────────────────────────────────────────────────────────
+def _find_swing_lows(lows: np.ndarray, left: int, right: int) -> list[float]:
+    """Return low values at swing-low candles."""
+    n = len(lows)
+    levels = []
+    for i in range(left, n - right):
+        window = lows[i - left: i + right + 1]
+        if lows[i] == window.min() and np.sum(window == lows[i]) == 1:
+            levels.append(float(lows[i]))
+    return levels
+
+
+# ── Scoring helpers ────────────────────────────────────────────────────────────
 
 def _count_touches(
-    level:    float,
-    highs:    np.ndarray,
-    lows:     np.ndarray,
+    level: float,
+    highs: np.ndarray,
+    lows:  np.ndarray,
     zone_pct: float,
-    side:     str,
+    side: str,
 ) -> int:
     zone = level * zone_pct / 100
     if side == "support":
@@ -168,27 +114,6 @@ def _merge_levels(levels: list[float], threshold_pct: float) -> list[float]:
     return merged
 
 
-# ── Fallback: swing highs/lows ─────────────────────────────────────────────────
-
-def _fallback_levels(
-    highs:         np.ndarray,
-    lows:          np.ndarray,
-    current_price: float,
-    min_dist:      float,
-) -> tuple[list[float], list[float]]:
-    """Simple swing high/low fallback when wick detection finds too few levels."""
-    swing_lows, swing_highs = [], []
-    n = len(lows)
-    for i in range(1, n - 1):
-        if lows[i]  < lows[i - 1]  and lows[i]  < lows[i + 1]:
-            swing_lows.append(float(lows[i]))
-        if highs[i] > highs[i - 1] and highs[i] > highs[i + 1]:
-            swing_highs.append(float(highs[i]))
-    supports    = sorted([p for p in swing_lows  if p < current_price - min_dist], reverse=True)
-    resistances = sorted([p for p in swing_highs if p > current_price + min_dist])
-    return supports, resistances
-
-
 # ── Main computation ───────────────────────────────────────────────────────────
 
 def compute_sr_levels(
@@ -196,40 +121,43 @@ def compute_sr_levels(
     current_price: float,
     symbol: str,
     timeframe: str,
+    pivot_left:       int   = SR_PIVOT_LEFT,
+    pivot_right:      int   = SR_PIVOT_RIGHT,
     merge_threshold:  float = SR_MERGE_THRESHOLD,
     min_distance_pct: float = SR_MIN_DISTANCE_PCT,
     touch_zone_pct:   float = SR_TOUCH_ZONE_PCT,
-    wick_body_ratio:  float = SR_WICK_BODY_RATIO,
-    min_body_pct:     float = SR_MIN_BODY_PCT,
     num_levels:       int   = 2,
 ) -> Optional[SRLevels]:
     """
-    Detect support/resistance levels from Bull/Bear Wick candles.
+    Compute num_levels support and resistance levels from swing highs/lows.
     Returns None if not enough levels found.
     """
-    if len(candles) < 10:
-        logger.warning("Not enough candles (%d) for %s", len(candles), symbol)
+    min_candles = pivot_left + pivot_right + 5
+    if len(candles) < min_candles:
+        logger.warning(
+            "Not enough candles (%d) to compute S/R for %s (need %d)",
+            len(candles), symbol, min_candles,
+        )
         return None
 
-    opens  = np.array([float(c[1]) for c in candles])
     highs  = np.array([float(c[2]) for c in candles])
     lows   = np.array([float(c[3]) for c in candles])
     closes = np.array([float(c[4]) for c in candles])
 
-    # 1. Detect wick-based levels
-    raw_supports    = _detect_bull_wicks(opens, highs, lows, closes, wick_body_ratio, min_body_pct)
-    raw_resistances = _detect_bear_wicks(opens, highs, lows, closes, wick_body_ratio, min_body_pct)
+    # 1. Detect swing highs/lows
+    raw_resistances = _find_swing_highs(highs, pivot_left, pivot_right)
+    raw_supports    = _find_swing_lows(lows,   pivot_left, pivot_right)
 
     # 2. Merge nearby levels
-    raw_supports    = _merge_levels(raw_supports,    merge_threshold)
     raw_resistances = _merge_levels(raw_resistances, merge_threshold)
+    raw_supports    = _merge_levels(raw_supports,    merge_threshold)
 
-    # 3. Distance filter
+    # 3. Distance filter — keep only levels outside min_distance_pct of price
     min_dist        = current_price * min_distance_pct / 100
     raw_supports    = [p for p in raw_supports    if p < current_price - min_dist]
     raw_resistances = [p for p in raw_resistances if p > current_price + min_dist]
 
-    # 4. Score and rank — unbroken levels first
+    # 4. Rank: unbroken levels first, then by touch count
     def _rank(levels: list[float], side: str) -> list[float]:
         unbroken, broken = [], []
         for lvl in levels:
@@ -243,23 +171,36 @@ def compute_sr_levels(
     supports    = _rank(raw_supports,    "support")
     resistances = _rank(raw_resistances, "resistance")
 
-    # 5. Fallback if not enough levels
+    # 5. Fallback if not enough levels found
     if len(supports) < num_levels or len(resistances) < num_levels:
-        fb_sup, fb_res = _fallback_levels(highs, lows, current_price, min_dist)
+        # Relax distance filter to half and retry
+        half_dist = min_dist / 2
         if len(supports) < num_levels:
-            supports = fb_sup
+            extra = _rank(
+                [p for p in _find_swing_lows(lows, pivot_left, pivot_right)
+                 if p < current_price - half_dist and p not in supports],
+                "support",
+            )
+            supports = (supports + extra)[:num_levels]
         if len(resistances) < num_levels:
-            resistances = fb_res
+            extra = _rank(
+                [p for p in _find_swing_highs(highs, pivot_left, pivot_right)
+                 if p > current_price + half_dist and p not in resistances],
+                "resistance",
+            )
+            resistances = (resistances + extra)[:num_levels]
 
     if len(supports) < num_levels or len(resistances) < num_levels:
         logger.warning(
-            "Could not find %d S/%d R for %s on %s (sup=%d res=%d)",
+            "Could not find %d S/%d R for %s on %s (found sup=%d res=%d)",
             num_levels, num_levels, symbol, timeframe,
             len(supports), len(resistances),
         )
         return None
 
-    # 6. Sort by proximity — S1 nearest below, R1 nearest above
+    # 6. Sort by proximity to current price
+    #    supports    → descending (S1 = nearest below price)
+    #    resistances → ascending  (R1 = nearest above price)
     supports    = sorted(supports[:num_levels],    reverse=True)
     resistances = sorted(resistances[:num_levels], reverse=False)
 
