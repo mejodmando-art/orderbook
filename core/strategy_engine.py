@@ -134,15 +134,49 @@ class StrategyEngine:
         })
         state.strategy_id = strategy_id
 
-        await self._place_orders(state)
+        # ── Check existing balance before placing buy orders ───────────────────
+        base_currency = symbol.split("/")[0]
+        try:
+            free_qty = await self._client.get_balance(base_currency)
+        except Exception as exc:
+            logger.warning("Could not fetch %s balance: %s — assuming 0", base_currency, exc)
+            free_qty = 0.0
+
+        current_price = levels.current_price
+        min_amt       = self._client.min_amount(symbol)
+        # Value of existing balance in USDT
+        existing_value = free_qty * current_price
+
+        if free_qty >= min_amt and existing_value >= total_investment * 0.8:
+            # Existing balance covers ≥80% of investment — treat it as the position
+            state.held_qty      = free_qty
+            state.avg_buy_price = current_price
+            logger.info(
+                "Strategy started with existing balance %s: qty=%.6f @ %.6f (value=%.2f USDT)",
+                symbol, free_qty, current_price, existing_value,
+            )
+            await db.update_strategy_state(
+                symbol,
+                held_qty      = state.held_qty,
+                avg_buy_price = state.avg_buy_price,
+                realized_pnl  = 0.0,
+                buy_count     = 0,
+                sell_count    = 0,
+            )
+            # Place sell orders at resistance levels immediately
+            await self._place_sell_orders(state)
+        else:
+            # No sufficient existing balance — place buy orders at supports
+            await self._place_orders(state)
+
         self._tasks[symbol] = asyncio.create_task(self._run_loop(state))
 
         logger.info(
-            "Strategy started: %s | tf=%s | S=[%.4f, %.4f] R=[%.4f, %.4f] | inv=%.2f",
+            "Strategy started: %s | tf=%s | S=%s R=%s | inv=%.2f | held=%.6f",
             symbol, timeframe,
-            levels.supports[0], levels.supports[1],
-            levels.resistances[0], levels.resistances[1],
-            total_investment,
+            [round(s, 6) for s in levels.supports],
+            [round(r, 6) for r in levels.resistances],
+            total_investment, state.held_qty,
         )
         return state
 
