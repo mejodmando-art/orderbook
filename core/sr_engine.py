@@ -27,6 +27,7 @@ from config.settings import (
     SR_PIVOT_LEFT,
     SR_PIVOT_RIGHT,
     SR_MERGE_THRESHOLD,
+    SR_MIN_DISTANCE_PCT,
 )
 from core.mexc_client import MexcClient
 
@@ -123,10 +124,11 @@ def compute_sr_levels(
     current_price: float,
     symbol: str,
     timeframe: str,
-    pivot_left:      int   = SR_PIVOT_LEFT,
-    pivot_right:     int   = SR_PIVOT_RIGHT,
-    merge_threshold: float = SR_MERGE_THRESHOLD,
-    num_levels:      int   = 2,
+    pivot_left:       int   = SR_PIVOT_LEFT,
+    pivot_right:      int   = SR_PIVOT_RIGHT,
+    merge_threshold:  float = SR_MERGE_THRESHOLD,
+    min_distance_pct: float = SR_MIN_DISTANCE_PCT,
+    num_levels:       int   = 2,
 ) -> Optional[SRLevels]:
     """
     Compute num_levels support and num_levels resistance levels using
@@ -156,9 +158,14 @@ def compute_sr_levels(
     raw_resistances = _filter_broken(raw_resistances, closes, "resistance")
     raw_supports    = _filter_broken(raw_supports,    closes, "support")
 
-    # 4. Split relative to current price, closest first
-    supports    = sorted([p for p in raw_supports    if p < current_price], reverse=True)
-    resistances = sorted([p for p in raw_resistances if p > current_price])
+    # 4. Split relative to current price, apply minimum distance filter
+    min_dist = current_price * min_distance_pct / 100
+    supports    = sorted(
+        [p for p in raw_supports    if p < current_price - min_dist], reverse=True
+    )
+    resistances = sorted(
+        [p for p in raw_resistances if p > current_price + min_dist]
+    )
 
     # 5. Fallback if pivot detection yields too few levels
     if len(supports) < num_levels or len(resistances) < num_levels:
