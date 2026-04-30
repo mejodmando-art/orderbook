@@ -1234,6 +1234,54 @@ async def notify_hourly_report(symbol: str, report: dict) -> None:
     )
 
 
+# ── S&R notifications ──────────────────────────────────────────────────────────
+
+async def notify_snr_buy_filled(symbol: str, price: float, qty: float, level: str) -> None:
+    if _is_muted(symbol) or _dedup_key(symbol, "snr_buy", f"{price:.6f}"):
+        return
+    level_ar = {"s1": "الدعم الأول 🟢", "s2": "الدعم الثاني 🟢"}.get(level, level)
+    await _send(
+        f"📥 *شراء S&R*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💱 الزوج: `{_fmt_symbol(symbol)}`\n"
+        f"📌 المستوى: {level_ar}\n"
+        f"💵 السعر: `{price:.6f}`\n"
+        f"🪙 الكمية: `{qty:.6f}`\n"
+        f"💰 القيمة: `{price*qty:.2f}` USDT\n"
+        f"🕐 الوقت: `{_now_str()}`"
+    )
+
+
+async def notify_snr_sell_filled(symbol: str, price: float, qty: float, pnl: float, level: str) -> None:
+    if _is_muted(symbol) or _dedup_key(symbol, "snr_sell", f"{price:.6f}"):
+        return
+    level_ar = {"r1": "المقاومة الأولى 🔴", "r2": "المقاومة الثانية 🔴"}.get(level, level)
+    sign = "+" if pnl >= 0 else ""
+    await _send(
+        f"📤 *بيع S&R*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💱 الزوج: `{_fmt_symbol(symbol)}`\n"
+        f"📌 المستوى: {level_ar}\n"
+        f"💵 السعر: `{price:.6f}`\n"
+        f"🪙 الكمية: `{qty:.6f}`\n"
+        f"💹 الربح: `{sign}{pnl:.4f}` USDT\n"
+        f"🕐 الوقت: `{_now_str()}`"
+    )
+
+
+async def notify_snr_refresh(symbol: str, timeframe: str, old_levels, new_levels) -> None:
+    if _is_muted(symbol):
+        return
+    await _send(
+        f"🔄 *تحديث مستويات S&R — {_fmt_symbol(symbol)}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏱ التايم فريم: `{timeframe}`\n"
+        f"📉 S1: `{new_levels.supports[0]:.6f}` | S2: `{new_levels.supports[1]:.6f}`\n"
+        f"📈 R1: `{new_levels.resistances[0]:.6f}` | R2: `{new_levels.resistances[1]:.6f}`\n"
+        f"🕐 الوقت: `{_now_str()}`"
+    )
+
+
 # ── send_notification (legacy / engine rebuild alerts) ─────────────────────────
 
 async def send_notification(text: str, application=None) -> None:

@@ -30,7 +30,11 @@ logger = logging.getLogger(__name__)
     AWAIT_GRID_UPPER_PCT,  # grid bot: upper breakout % before rebuild
     AWAIT_GRID_LOWER_PCT,  # grid bot: lower breakout % before rebuild
     AWAIT_ADJUST_INV,      # adjust investment: new amount (free text)
-) = range(6)
+    AWAIT_SNR_PAIR,        # S&R: trading pair
+    AWAIT_SNR_AMOUNT,      # S&R: investment amount
+) = range(8)
+
+SNR_TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
 
 POPULAR_PAIRS = [
     "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
@@ -86,6 +90,7 @@ def _kb_main() -> InlineKeyboardMarkup:
          InlineKeyboardButton("⛔ إيقاف الكل",        callback_data="menu_stopall")],
         [InlineKeyboardButton("🔄 ترقية الشبكات",     callback_data="settings_upgradeall"),
          InlineKeyboardButton("❓ مساعدة",            callback_data="menu_help")],
+        [InlineKeyboardButton("📈 استراتيجية S&R",    callback_data="snr:back")],
     ])
 
 
@@ -689,6 +694,265 @@ async def _show_status(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _edit(query, "\n".join(lines), kb)
 
 
+# ── S&R Menu ───────────────────────────────────────────────────────────────────
+
+def _kb_snr_main() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚀 استراتيجية جديدة",  callback_data="snr:new"),
+         InlineKeyboardButton("📋 الاستراتيجيات",     callback_data="snr:list")],
+        [InlineKeyboardButton("💼 الرصيد",            callback_data="snr:balance"),
+         InlineKeyboardButton("🛑 إيقاف استراتيجية",  callback_data="snr:stop_menu")],
+        [InlineKeyboardButton("🔙 القائمة الرئيسية",  callback_data="menu:back")],
+    ])
+
+def _kb_snr_tf() -> InlineKeyboardMarkup:
+    rows = []
+    row = []
+    for tf in SNR_TIMEFRAMES:
+        row.append(InlineKeyboardButton(tf, callback_data=f"snrtf:{tf}"))
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="snr:back")])
+    return InlineKeyboardMarkup(rows)
+
+def _kb_snr_strategy(symbol: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 تفاصيل",           callback_data=f"snrdetail:{symbol}"),
+         InlineKeyboardButton("🔄 تحديث المستويات",  callback_data=f"snrrefresh:{symbol}")],
+        [InlineKeyboardButton("⛔ إيقاف وبيع",       callback_data=f"snrstop:{symbol}"),
+         InlineKeyboardButton("🔙 رجوع",             callback_data="snr:list")],
+    ])
+
+
+async def _cb_snr(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":")[1]
+
+    if action == "back":
+        await _edit(query, "📈 *قائمة S&R*\n\nاختر:", _kb_snr_main())
+        return None
+
+    if action == "new":
+        await _edit(query,
+            "✏️ *استراتيجية S&R جديدة*\n\nأرسل رمز الزوج (مثال: `BTCUSDT`):",
+            InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="snr:back")]]),
+        )
+        ctx.user_data["snr_step"] = "pair"
+        return AWAIT_SNR_PAIR
+
+    if action == "list":
+        snr_engine = ctx.bot_data.get("snr_engine")
+        symbols = snr_engine.active_symbols() if snr_engine else []
+        if not symbols:
+            await query.answer("لا توجد استراتيجيات نشطة.", show_alert=True)
+            return None
+        rows = [[InlineKeyboardButton(f"📊 {s}", callback_data=f"snrdetail:{s}")] for s in symbols]
+        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="snr:back")])
+        await _edit(query, f"📋 *الاستراتيجيات النشطة ({len(symbols)}):*", InlineKeyboardMarkup(rows))
+        return None
+
+    if action == "stop_menu":
+        snr_engine = ctx.bot_data.get("snr_engine")
+        symbols = snr_engine.active_symbols() if snr_engine else []
+        if not symbols:
+            await query.answer("لا توجد استراتيجيات نشطة.", show_alert=True)
+            return None
+        rows = [[InlineKeyboardButton(f"🛑 {s}", callback_data=f"snrstop:{s}")] for s in symbols]
+        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="snr:back")])
+        await _edit(query, "🛑 *اختر الاستراتيجية للإيقاف:*", InlineKeyboardMarkup(rows))
+        return None
+
+    if action == "balance":
+        snr_engine = ctx.bot_data.get("snr_engine")
+        client     = ctx.bot_data.get("client")
+        symbols    = snr_engine.active_symbols() if snr_engine else []
+        if not symbols:
+            await query.answer("لا توجد استراتيجيات نشطة.", show_alert=True)
+            return None
+        lines = ["💼 *رصيد S&R*\n━━━━━━━━━━━━━━━━━━━━"]
+        for sym in symbols:
+            report = snr_engine.calc_report(sym)
+            if not report:
+                continue
+            try:
+                price = await client.get_current_price(sym)
+                val   = report["held_qty"] * price
+                lines.append(
+                    f"\n🔹 *{sym}*\n"
+                    f"  💰 مخصص: `{report['total_investment']:.2f}` USDT\n"
+                    f"  📦 فعلي: `{val:.2f}` USDT\n"
+                    f"  💹 ربح محقق: `{report['realized_pnl']:+.4f}` USDT"
+                )
+            except Exception as exc:
+                lines.append(f"\n⚠️ *{sym}*: {exc}")
+        await _edit(query, "\n".join(lines),
+                    InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="snr:back")]]))
+        return None
+
+    return None
+
+
+async def _cb_snrtf(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    tf   = query.data.split(":")[1]
+    pair = ctx.user_data.get("snr_pair", "")
+    ctx.user_data["snr_tf"] = tf
+    await _edit(query,
+        f"💵 *المبلغ — {pair} | {tf}*\n\nأرسل مبلغ الاستثمار بـ USDT (مثال: `200`):",
+        InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="snr:back")]]),
+    )
+    return AWAIT_SNR_AMOUNT
+
+
+async def _recv_snr_pair(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _authorized(update):
+        return ConversationHandler.END
+    raw  = (update.message.text or "").strip().upper()
+    pair = raw if "/" in raw else (raw.replace("USDT", "/USDT") if raw.endswith("USDT") else raw + "/USDT")
+    ctx.user_data["snr_pair"] = pair
+    await update.message.reply_text(
+        f"⏱ *التايم فريم — {pair}*\n\nاختر التايم فريم لحساب الدعم والمقاومة:",
+        reply_markup=_kb_snr_tf(), parse_mode=ParseMode.MARKDOWN,
+    )
+    return AWAIT_SNR_AMOUNT  # wait for tf button then amount
+
+
+async def _recv_snr_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _authorized(update):
+        return ConversationHandler.END
+    text = (update.message.text or "").strip()
+    try:
+        amount = float(text)
+        assert amount >= 10
+    except (ValueError, AssertionError):
+        await update.message.reply_text(
+            "❌ أدخل رقماً لا يقل عن 10 USDT (مثال: `200`)", parse_mode=ParseMode.MARKDOWN
+        )
+        return AWAIT_SNR_AMOUNT
+
+    pair = ctx.user_data.get("snr_pair", "")
+    tf   = ctx.user_data.get("snr_tf", "1h")
+    snr_engine = ctx.bot_data.get("snr_engine")
+    if not snr_engine:
+        await update.message.reply_text("❌ محرك S&R غير متاح.")
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        f"⏳ جاري حساب مستويات الدعم والمقاومة لـ `{pair}` على `{tf}`...",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    try:
+        state = await snr_engine.start(symbol=pair, timeframe=tf, total_investment=amount)
+        lv = state.levels
+        await update.message.reply_text(
+            f"✅ *استراتيجية S&R مُشغَّلة*\n\n"
+            f"🪙 الزوج: `{pair}` | ⏱ `{tf}`\n"
+            f"💵 الاستثمار: `{amount:.0f}` USDT\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📉 *شراء عند:*\n"
+            f"  🟢 S1: `{lv.supports[0]:.6f}`\n"
+            f"  🟢 S2: `{lv.supports[1]:.6f}`\n\n"
+            f"📈 *بيع عند:*\n"
+            f"  🔴 R1: `{lv.resistances[0]:.6f}`\n"
+            f"  🔴 R2: `{lv.resistances[1]:.6f}`\n\n"
+            f"💵 السعر الحالي: `{lv.current_price:.6f}`",
+            reply_markup=_kb_snr_strategy(pair),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"❌ فشل التشغيل: `{exc}`", parse_mode=ParseMode.MARKDOWN)
+    return ConversationHandler.END
+
+
+async def _cb_snrdetail(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    symbol     = query.data.split(":", 1)[1]
+    snr_engine = ctx.bot_data.get("snr_engine")
+    client     = ctx.bot_data.get("client")
+    report     = snr_engine.calc_report(symbol) if snr_engine else None
+    if not report:
+        await query.answer("الاستراتيجية غير نشطة.", show_alert=True)
+        return
+    try:
+        price = await client.get_current_price(symbol)
+        upnl  = (price - report["avg_buy_price"]) * report["held_qty"] if report["held_qty"] else 0.0
+    except Exception:
+        price, upnl = report["current_price"], 0.0
+    total = report["realized_pnl"] + upnl
+    await _edit(query,
+        f"📊 *تفاصيل S&R — `{symbol}`*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏱ التايم فريم: `{report['timeframe']}`\n"
+        f"💵 الاستثمار: `{report['total_investment']:.2f}` USDT\n"
+        f"💵 السعر الحالي: `{price:.6f}`\n\n"
+        f"📉 S1: `{report['support1']:.6f}` | S2: `{report['support2']:.6f}`\n"
+        f"📈 R1: `{report['resistance1']:.6f}` | R2: `{report['resistance2']:.6f}`\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🪙 الكمية: `{report['held_qty']:.6f}` | متوسط: `{report['avg_buy_price']:.6f}`\n"
+        f"✅ شراء: `{report['buy_count']}` | بيع: `{report['sell_count']}`\n"
+        f"🔓 أوامر مفتوحة: `{report['open_orders']}`\n\n"
+        f"💹 محقق: `{report['realized_pnl']:+.4f}` | غير محقق: `{upnl:+.4f}`\n"
+        f"🏆 الإجمالي: `{total:+.4f}` USDT",
+        _kb_snr_strategy(symbol),
+    )
+
+
+async def _cb_snrrefresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    symbol     = query.data.split(":", 1)[1]
+    snr_engine = ctx.bot_data.get("snr_engine")
+    state      = snr_engine.get_state(symbol) if snr_engine else None
+    if not state:
+        await query.answer("الاستراتيجية غير نشطة.", show_alert=True)
+        return
+    await _edit(query, f"⏳ جاري تحديث مستويات `{symbol}`...", _kb_back())
+    try:
+        await snr_engine._refresh_orders(state)
+        lv = state.levels
+        await _edit(query,
+            f"✅ *تم تحديث المستويات — `{symbol}`*\n\n"
+            f"📉 S1: `{lv.supports[0]:.6f}` | S2: `{lv.supports[1]:.6f}`\n"
+            f"📈 R1: `{lv.resistances[0]:.6f}` | R2: `{lv.resistances[1]:.6f}`",
+            _kb_snr_strategy(symbol),
+        )
+    except Exception as exc:
+        await _edit(query, f"❌ فشل التحديث: `{exc}`", _kb_snr_strategy(symbol))
+
+
+async def _cb_snrstop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    symbol = query.data.split(":", 1)[1]
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ نعم، أوقف وبيع", callback_data=f"snrconfirmstop:{symbol}"),
+         InlineKeyboardButton("❌ إلغاء",           callback_data=f"snrdetail:{symbol}")],
+    ])
+    await _edit(query, f"⚠️ هل تريد إيقاف استراتيجية *`{symbol}`* وبيع كل الكميات؟", kb)
+
+
+async def _cb_snrconfirmstop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    symbol     = query.data.split(":", 1)[1]
+    snr_engine = ctx.bot_data.get("snr_engine")
+    await _edit(query, f"⏳ جاري إيقاف `{symbol}`...", _kb_back())
+    try:
+        val = await snr_engine.stop(symbol, market_sell=True)
+        await _edit(query,
+            f"🛑 *تم إيقاف `{symbol}`*\n💵 قيمة البيع: `{val:.4f}` USDT",
+            InlineKeyboardMarkup([[InlineKeyboardButton("🏠 القائمة", callback_data="menu:back")]]),
+        )
+    except Exception as exc:
+        await _edit(query, f"❌ خطأ: `{exc}`", _kb_back())
+
+
 # ── Registration ───────────────────────────────────────────────────────────────
 
 def register_menu_handlers(app: Application) -> None:
@@ -711,16 +975,40 @@ def register_menu_handlers(app: Application) -> None:
         per_message=False,
     )
 
+    # ── S&R conversation ───────────────────────────────────────────────────────
+    snr_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(_cb_snr, pattern=r"^snr:new$")],
+        states={
+            AWAIT_SNR_PAIR:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_snr_pair)],
+            AWAIT_SNR_AMOUNT: [
+                CallbackQueryHandler(_cb_snrtf,       pattern=r"^snrtf:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_snr_amount),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("menu", cmd_menu),
+            CallbackQueryHandler(_cb_menu, pattern=r"^menu:"),
+        ],
+        per_message=False,
+    )
+
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(conv)
-    app.add_handler(CallbackQueryHandler(_cb_menu,     pattern=r"^menu:"))
-    app.add_handler(CallbackQueryHandler(_cb_grid,     pattern=r"^grid:"))
-    app.add_handler(CallbackQueryHandler(_cb_gridrisk, pattern=r"^gridrisk:"))
-    app.add_handler(CallbackQueryHandler(_cb_gridstop, pattern=r"^gridstop:"))
-    app.add_handler(CallbackQueryHandler(_cb_adjinv,   pattern=r"^adjinv:"))
+    app.add_handler(snr_conv)
+    app.add_handler(CallbackQueryHandler(_cb_menu,           pattern=r"^menu:"))
+    app.add_handler(CallbackQueryHandler(_cb_grid,           pattern=r"^grid:"))
+    app.add_handler(CallbackQueryHandler(_cb_gridrisk,       pattern=r"^gridrisk:"))
+    app.add_handler(CallbackQueryHandler(_cb_gridstop,       pattern=r"^gridstop:"))
+    app.add_handler(CallbackQueryHandler(_cb_adjinv,         pattern=r"^adjinv:"))
     app.add_handler(CallbackQueryHandler(
         lambda u, c: _show_adjust_inv(u.callback_query, c, u.callback_query.data.split(":", 1)[1]),
         pattern=r"^adjinv_show:",
     ))
+    # S&R callbacks
+    app.add_handler(CallbackQueryHandler(_cb_snr,            pattern=r"^snr:"))
+    app.add_handler(CallbackQueryHandler(_cb_snrdetail,      pattern=r"^snrdetail:"))
+    app.add_handler(CallbackQueryHandler(_cb_snrrefresh,     pattern=r"^snrrefresh:"))
+    app.add_handler(CallbackQueryHandler(_cb_snrstop,        pattern=r"^snrstop:"))
+    app.add_handler(CallbackQueryHandler(_cb_snrconfirmstop, pattern=r"^snrconfirmstop:"))
 
-    logger.info("Grid Bot menu handlers registered")
+    logger.info("Grid + S&R menu handlers registered")

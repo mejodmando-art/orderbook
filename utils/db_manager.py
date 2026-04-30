@@ -103,6 +103,38 @@ async def _create_tables() -> None:
                 value   TEXT NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
+
+            CREATE TABLE IF NOT EXISTS active_strategies (
+                id               SERIAL PRIMARY KEY,
+                symbol           TEXT NOT NULL UNIQUE,
+                timeframe        TEXT NOT NULL DEFAULT '1h',
+                total_investment NUMERIC NOT NULL,
+                support1         NUMERIC NOT NULL,
+                support2         NUMERIC NOT NULL,
+                resistance1      NUMERIC NOT NULL,
+                resistance2      NUMERIC NOT NULL,
+                held_qty         NUMERIC DEFAULT 0,
+                avg_buy_price    NUMERIC DEFAULT 0,
+                realized_pnl     NUMERIC DEFAULT 0,
+                buy_count        INTEGER DEFAULT 0,
+                sell_count       INTEGER DEFAULT 0,
+                started_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                is_active        BOOLEAN NOT NULL DEFAULT TRUE
+            );
+
+            CREATE TABLE IF NOT EXISTS snr_trade_history (
+                id          SERIAL PRIMARY KEY,
+                symbol      TEXT NOT NULL,
+                side        TEXT NOT NULL,
+                price       NUMERIC NOT NULL,
+                qty         NUMERIC NOT NULL,
+                order_id    TEXT,
+                strategy_id INTEGER REFERENCES active_strategies(id),
+                pnl         NUMERIC DEFAULT 0,
+                level       TEXT DEFAULT '',
+                executed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
         """)
     logger.debug("Tables verified / created")
 
@@ -292,3 +324,112 @@ async def get_config(key: str, default: str = "") -> str:
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT value FROM bot_config WHERE key = $1", key)
     return row["value"] if row else default
+
+
+# ── active_strategies (S&R) ────────────────────────────────────────────────────
+
+async def upsert_strategy(data: dict) -> int:
+    pool = get_db()
+    row = {
+        "symbol":           data.get("symbol", ""),
+        "timeframe":        data.get("timeframe", "1h"),
+        "total_investment": float(data.get("total_investment", 0)),
+        "support1":         float(data.get("support1", 0)),
+        "support2":         float(data.get("support2", 0)),
+        "resistance1":      float(data.get("resistance1", 0)),
+        "resistance2":      float(data.get("resistance2", 0)),
+        "is_active":        bool(data.get("is_active", True)),
+    }
+    async with pool.acquire() as conn:
+        sid = await conn.fetchval(
+            """
+            INSERT INTO active_strategies
+                (symbol, timeframe, total_investment,
+                 support1, support2, resistance1, resistance2, is_active)
+            VALUES ($1, $2, $3::numeric, $4::numeric, $5::numeric, $6::numeric, $7::numeric, $8)
+            ON CONFLICT (symbol) DO UPDATE SET
+                timeframe        = COALESCE(EXCLUDED.timeframe, active_strategies.timeframe),
+                total_investment = CASE WHEN $3::numeric > 0 THEN $3::numeric ELSE active_strategies.total_investment END,
+                support1         = CASE WHEN $4::numeric > 0 THEN $4::numeric ELSE active_strategies.support1 END,
+                support2         = CASE WHEN $5::numeric > 0 THEN $5::numeric ELSE active_strategies.support2 END,
+                resistance1      = CASE WHEN $6::numeric > 0 THEN $6::numeric ELSE active_strategies.resistance1 END,
+                resistance2      = CASE WHEN $7::numeric > 0 THEN $7::numeric ELSE active_strategies.resistance2 END,
+                is_active        = EXCLUDED.is_active,
+                updated_at       = NOW()
+            RETURNING id
+            """,
+            row["symbol"], row["timeframe"], row["total_investment"],
+            row["support1"], row["support2"], row["resistance1"], row["resistance2"],
+            row["is_active"],
+        )
+    return sid
+
+
+async def get_all_active_strategies() -> list[dict]:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM active_strategies WHERE is_active = TRUE ORDER BY started_at"
+        )
+    return [dict(r) for r in rows]
+
+
+async def deactivate_strategy(symbol: str) -> None:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE active_strategies SET is_active = FALSE, updated_at = NOW() WHERE symbol = $1",
+            symbol,
+        )
+
+
+async def update_strategy_state(
+    symbol: str,
+    held_qty: float,
+    avg_buy_price: float,
+    realized_pnl: float,
+    buy_count: int,
+    sell_count: int,
+) -> None:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE active_strategies
+               SET held_qty = $2, avg_buy_price = $3, realized_pnl = $4,
+                   buy_count = $5, sell_count = $6, updated_at = NOW()
+               WHERE symbol = $1""",
+            symbol, held_qty, avg_buy_price, realized_pnl, buy_count, sell_count,
+        )
+
+
+async def record_snr_trade(
+    symbol: str,
+    side: str,
+    price: float,
+    qty: float,
+    order_id: str = "",
+    strategy_id: Optional[int] = None,
+    pnl: float = 0.0,
+    level: str = "",
+) -> None:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO snr_trade_history
+               (symbol, side, price, qty, order_id, strategy_id, pnl, level)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)""",
+            symbol, side, price, qty, order_id, strategy_id, pnl, level,
+        )
+
+
+async def get_snr_trade_history(symbol: str, days: int = 30) -> list[dict]:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT * FROM snr_trade_history
+               WHERE symbol = $1
+                 AND executed_at >= NOW() - ($2 * INTERVAL '1 day')
+               ORDER BY executed_at DESC""",
+            symbol, days,
+        )
+    return [dict(r) for r in rows]

@@ -6,7 +6,8 @@ import logging
 
 from config.settings import LOG_LEVEL, validate_env
 from core.mexc_client import MexcClient
-from core.grid_engine import GridEngine, set_notifiers
+from core.grid_engine import GridEngine, set_notifiers as grid_set_notifiers
+from core.strategy_engine import StrategyEngine, set_notifiers as snr_set_notifiers
 from bot.telegram_bot import (
     build_application,
     send_notification,
@@ -16,8 +17,11 @@ from bot.telegram_bot import (
     notify_grid_expansion,
     notify_error,
     notify_balance_drift,
+    notify_snr_buy_filled,
+    notify_snr_sell_filled,
+    notify_snr_refresh,
 )
-from utils.db_manager import init_db, close_db, get_all_active_grids
+from utils.db_manager import init_db, close_db, get_all_active_grids, get_all_active_strategies
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -51,6 +55,7 @@ async def _on_startup(application) -> None:
     client = application.bot_data["client"]
     await client.load_markets()
 
+    # ── Recover Grid strategies ────────────────────────────────────────────────
     engine: GridEngine = application.bot_data["engine"]
     active = await get_all_active_grids()
     recovered, upgraded, failed = 0, 0, 0
@@ -73,25 +78,51 @@ async def _on_startup(application) -> None:
         await _upgrade_existing_grids(engine)
         upgraded = recovered
 
+    # ── Recover S&R strategies ─────────────────────────────────────────────────
+    snr_engine: StrategyEngine = application.bot_data["snr_engine"]
+    snr_active = await get_all_active_strategies()
+    snr_recovered, snr_failed = 0, 0
+
+    for row in snr_active:
+        symbol = row["symbol"]
+        try:
+            await snr_engine.start(
+                symbol=symbol,
+                timeframe=row["timeframe"],
+                total_investment=float(row["total_investment"]),
+            )
+            snr_recovered += 1
+        except Exception as exc:
+            logger.error("Failed to recover S&R strategy %s: %s", symbol, exc)
+            snr_failed += 1
+
     await send_notification(
         "🤖 *AI Grid Bot* — تم التشغيل بنجاح!\n"
-        f"📊 شبكات مستردة: `{recovered}` | مُرقَّاة: `{upgraded}` | فشلت: `{failed}`\n"
+        f"📊 شبكات Grid مستردة: `{recovered}` | مُرقَّاة: `{upgraded}` | فشلت: `{failed}`\n"
+        f"📈 استراتيجيات S&R مستردة: `{snr_recovered}` | فشلت: `{snr_failed}`\n"
         "اكتب /menu للقائمة التفاعلية.",
         application=application,
     )
-    logger.info("Startup complete. Grids=%d", recovered)
+    logger.info("Startup complete. Grids=%d S&R=%d", recovered, snr_recovered)
 
 
 async def _on_shutdown(application) -> None:
     logger.info("Shutting down…")
-    engine: GridEngine = application.bot_data["engine"]
-    client: MexcClient = application.bot_data["client"]
+    engine:     GridEngine     = application.bot_data["engine"]
+    snr_engine: StrategyEngine = application.bot_data["snr_engine"]
+    client:     MexcClient     = application.bot_data["client"]
 
     for symbol in list(engine.active_symbols()):
         try:
             await engine.stop(symbol, market_sell=False)
         except Exception as exc:
             logger.error("Error stopping grid %s: %s", symbol, exc)
+
+    for symbol in list(snr_engine.active_symbols()):
+        try:
+            await snr_engine.stop(symbol, market_sell=False)
+        except Exception as exc:
+            logger.error("Error stopping S&R %s: %s", symbol, exc)
 
     await client.close()
     await close_db()
@@ -108,11 +139,14 @@ def main() -> None:
         app = _notify_ref.get("app")
         await send_notification(text, application=app)
 
-    engine = GridEngine(client=client, notify=notify)
+    engine     = GridEngine(client=client, notify=notify)
+    snr_engine = StrategyEngine(client=client)
+
     app = build_application(engine, client)
     _notify_ref["app"] = app
 
-    set_notifiers(
+    # Grid notifiers
+    grid_set_notifiers(
         buy_filled     = notify_buy_filled,
         sell_filled    = notify_sell_filled,
         grid_rebuild   = notify_grid_rebuild,
@@ -121,8 +155,17 @@ def main() -> None:
         balance_drift  = notify_balance_drift,
     )
 
-    app.bot_data["client"] = client
-    app.bot_data["engine"] = engine
+    # S&R notifiers
+    snr_set_notifiers(
+        buy_filled  = notify_snr_buy_filled,
+        sell_filled = notify_snr_sell_filled,
+        sr_refresh  = notify_snr_refresh,
+        error       = notify_error,
+    )
+
+    app.bot_data["client"]     = client
+    app.bot_data["engine"]     = engine
+    app.bot_data["snr_engine"] = snr_engine
     app.post_init     = _on_startup
     app.post_shutdown = _on_shutdown
 

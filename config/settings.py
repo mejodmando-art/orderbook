@@ -36,6 +36,10 @@ ALLOWED_USER_IDS: set[int] = (
 ORDER_SLEEP_SECONDS: float = 0.25   # pause between REST calls to respect rate limits
 FILL_POLL_INTERVAL: int = 10        # seconds between fill-check cycles
 
+# ── S/R clustering ─────────────────────────────────────────────────────────────
+SR_LOOKBACK_CANDLES: int    = 200
+SR_CLUSTER_BANDWIDTH: float = 0.005
+
 # ── Auto-Trade Mode defaults ───────────────────────────────────────────────────
 # All values are overridable at runtime via Telegram commands.
 AUTO_SCAN_INTERVAL_MINUTES: int = int(os.getenv("AUTO_SCAN_INTERVAL_MINUTES", "60"))
