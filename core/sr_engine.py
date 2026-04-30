@@ -1,18 +1,24 @@
 """
-Support & Resistance level detection — LuxAlgo pivot method.
+Support & Resistance level detection — Order Block / Liquidity method.
 
-Algorithm:
-  1. Fetch last SR_LOOKBACK_CANDLES candles on the requested timeframe.
-  2. Detect pivot highs (resistance candidates) and pivot lows (support
-     candidates) using SR_PIVOT_LEFT/RIGHT confirmation bars.
-  3. Score each level by the number of times price has touched it
-     (touched = candle high/low came within SR_TOUCH_ZONE_PCT of the level).
-     More touches = stronger level.
-  4. Keep only unbroken levels (price never closed through them).
-     If not enough unbroken levels exist, include broken ones as fallback.
-  5. Merge levels within SR_MERGE_THRESHOLD % of each other.
-  6. Apply SR_MIN_DISTANCE_PCT: discard levels too close to current price.
-  7. Return the num_levels strongest supports and resistances.
+Algorithm (mirrors the indicator visible in the screenshot):
+  1. Fetch SR_LOOKBACK_CANDLES candles on the requested timeframe.
+  2. Detect Swing Highs and Swing Lows using SR_PIVOT_LEFT/RIGHT bars.
+  3. For each swing high: the candle body top (max of open/close) is the
+     resistance level.  For each swing low: the candle body bottom
+     (min of open/close) is the support level.
+     Using the body instead of the wick gives cleaner order-block levels
+     (matches the red/blue horizontal bars in the screenshot).
+  4. Score each level by the number of subsequent candles that returned
+     to test it (touches within SR_TOUCH_ZONE_PCT).
+  5. Keep only UNBROKEN levels — a support is broken when a candle
+     closes below it; a resistance when a candle closes above it.
+     Broken levels are included as fallback only if not enough unbroken
+     ones exist.
+  6. Merge levels within SR_MERGE_THRESHOLD % of each other.
+  7. Apply SR_MIN_DISTANCE_PCT: discard levels too close to current price.
+  8. Sort supports descending (nearest first) and resistances ascending
+     (nearest first), then return the top num_levels of each.
 """
 from __future__ import annotations
 
@@ -39,61 +45,64 @@ VALID_TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d
 
 @dataclass
 class SRLevels:
-    supports:      list[float]   # strongest first, all below current price
-    resistances:   list[float]   # strongest first, all above current price
+    supports:      list[float]   # nearest first (descending), all below current price
+    resistances:   list[float]   # nearest first (ascending),  all above current price
     current_price: float
     timeframe:     str
     symbol:        str
 
 
-# ── Pivot detection ────────────────────────────────────────────────────────────
+# ── Swing detection ────────────────────────────────────────────────────────────
 
-def _pivot_highs(highs: np.ndarray, left: int, right: int) -> list[float]:
+def _swing_highs(highs: np.ndarray, left: int, right: int) -> list[int]:
+    """Return indices of candles that are swing highs."""
     n = len(highs)
-    pivots = []
+    indices = []
     for i in range(left, n - right):
         window = highs[i - left: i + right + 1]
         if highs[i] == window.max() and np.sum(window == highs[i]) == 1:
-            pivots.append(float(highs[i]))
-    return pivots
+            indices.append(i)
+    return indices
 
 
-def _pivot_lows(lows: np.ndarray, left: int, right: int) -> list[float]:
+def _swing_lows(lows: np.ndarray, left: int, right: int) -> list[int]:
+    """Return indices of candles that are swing lows."""
     n = len(lows)
-    pivots = []
+    indices = []
     for i in range(left, n - right):
         window = lows[i - left: i + right + 1]
         if lows[i] == window.min() and np.sum(window == lows[i]) == 1:
-            pivots.append(float(lows[i]))
-    return pivots
+            indices.append(i)
+    return indices
 
 
 # ── Touch scoring ──────────────────────────────────────────────────────────────
 
 def _count_touches(
-    level:    float,
-    highs:    np.ndarray,
-    lows:     np.ndarray,
-    zone_pct: float,
-    side:     str,
+    level:     float,
+    highs:     np.ndarray,
+    lows:      np.ndarray,
+    zone_pct:  float,
+    side:      str,
+    after_idx: int = 0,
 ) -> int:
     """
-    Count candles that touched the level within zone_pct %.
+    Count candles after after_idx that tested the level within zone_pct %.
     Support: candle low within zone. Resistance: candle high within zone.
     """
     zone = level * zone_pct / 100
     if side == "support":
-        return int(np.sum(np.abs(lows - level) <= zone))
+        return int(np.sum(np.abs(lows[after_idx:] - level) <= zone))
     else:
-        return int(np.sum(np.abs(highs - level) <= zone))
+        return int(np.sum(np.abs(highs[after_idx:] - level) <= zone))
 
 
-def _is_broken(level: float, closes: np.ndarray, side: str) -> bool:
-    """Return True if price has closed through the level."""
+def _is_broken(level: float, closes: np.ndarray, side: str, after_idx: int = 0) -> bool:
+    """Return True if price closed through the level after after_idx."""
     if side == "support":
-        return bool(np.any(closes < level))
+        return bool(np.any(closes[after_idx:] < level))
     else:
-        return bool(np.any(closes > level))
+        return bool(np.any(closes[after_idx:] > level))
 
 
 # ── Level merging ──────────────────────────────────────────────────────────────
@@ -127,8 +136,7 @@ def compute_sr_levels(
     num_levels:       int   = 2,
 ) -> Optional[SRLevels]:
     """
-    Compute num_levels support and resistance levels ranked by touch count.
-    Unbroken levels with most touches come first.
+    Compute num_levels support and resistance levels using order-block logic.
     Returns None if not enough levels found.
     """
     min_candles = pivot_left + pivot_right + 5
@@ -139,24 +147,31 @@ def compute_sr_levels(
         )
         return None
 
+    opens  = np.array([float(c[1]) for c in candles])
     highs  = np.array([float(c[2]) for c in candles])
     lows   = np.array([float(c[3]) for c in candles])
     closes = np.array([float(c[4]) for c in candles])
 
-    # 1. Detect pivot highs/lows
-    raw_resistances = _pivot_highs(highs, pivot_left, pivot_right)
-    raw_supports    = _pivot_lows(lows,   pivot_left, pivot_right)
+    # 1. Detect swing indices
+    sh_indices = _swing_highs(highs, pivot_left, pivot_right)
+    sl_indices = _swing_lows(lows,   pivot_left, pivot_right)
 
-    # 2. Merge nearby levels
+    # 2. Extract order-block levels from candle bodies
+    #    Resistance = top of body at swing high  (max of open/close)
+    #    Support    = bottom of body at swing low (min of open/close)
+    raw_resistances = [float(max(opens[i], closes[i])) for i in sh_indices]
+    raw_supports    = [float(min(opens[i], closes[i])) for i in sl_indices]
+
+    # 3. Merge nearby levels
     raw_resistances = _merge_levels(raw_resistances, merge_threshold)
     raw_supports    = _merge_levels(raw_supports,    merge_threshold)
 
-    # 3. Apply minimum distance filter
-    min_dist = current_price * min_distance_pct / 100
+    # 4. Apply minimum distance filter
+    min_dist        = current_price * min_distance_pct / 100
     raw_supports    = [p for p in raw_supports    if p < current_price - min_dist]
     raw_resistances = [p for p in raw_resistances if p > current_price + min_dist]
 
-    # 4. Rank by touch count — unbroken levels first, then broken
+    # 5. Score and rank — unbroken levels first, then broken as fallback
     def _rank(levels: list[float], side: str) -> list[float]:
         unbroken, broken = [], []
         for lvl in levels:
@@ -170,7 +185,7 @@ def compute_sr_levels(
     supports    = _rank(raw_supports,    "support")
     resistances = _rank(raw_resistances, "resistance")
 
-    # 5. Fallback if not enough levels
+    # 6. Fallback if not enough levels
     if len(supports) < num_levels or len(resistances) < num_levels:
         fb_sup, fb_res = _fallback_levels(highs, lows, current_price, min_dist)
         if len(supports) < num_levels:
@@ -187,11 +202,9 @@ def compute_sr_levels(
         )
         return None
 
-    # 6. Sort by price proximity to current price:
-    #    supports    → descending (nearest first, i.e. highest price below current)
-    #    resistances → ascending  (nearest first, i.e. lowest price above current)
-    #    This ensures S1 is the nearest support and R1 is the nearest resistance,
-    #    so each Si is paired with a distinct Ri in order.
+    # 7. Sort by proximity to current price
+    #    supports    → descending (S1 = nearest below price)
+    #    resistances → ascending  (R1 = nearest above price)
     supports    = sorted(supports[:num_levels],    reverse=True)
     resistances = sorted(resistances[:num_levels], reverse=False)
 
@@ -211,24 +224,24 @@ def _fallback_levels(
     min_dist:      float,
 ) -> tuple[list[float], list[float]]:
     """
-    Fallback: swing lows/highs sorted by distance from price
-    (furthest first = more significant level).
+    Fallback: simple swing lows/highs when order-block detection finds
+    too few levels. Sorted nearest-first.
     """
     swing_lows, swing_highs = [], []
     n = len(lows)
     for i in range(1, n - 1):
         if lows[i]  < lows[i - 1]  and lows[i]  < lows[i + 1]:
-            swing_lows.append(lows[i])
+            swing_lows.append(float(lows[i]))
         if highs[i] > highs[i - 1] and highs[i] > highs[i + 1]:
-            swing_highs.append(highs[i])
+            swing_highs.append(float(highs[i]))
 
     supports    = sorted(
         [p for p in swing_lows  if p < current_price - min_dist],
-        key=lambda p: abs(p - current_price), reverse=True,
+        reverse=True,
     )
     resistances = sorted(
         [p for p in swing_highs if p > current_price + min_dist],
-        key=lambda p: abs(p - current_price), reverse=True,
+        reverse=False,
     )
     return supports, resistances
 
