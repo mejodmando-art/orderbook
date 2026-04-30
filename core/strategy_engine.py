@@ -254,7 +254,19 @@ class StrategyEngine:
         )
         return state
 
-    async def stop(self, symbol: str, market_sell: bool = True) -> float:
+    async def stop(
+        self,
+        symbol: str,
+        market_sell: bool = True,
+        persist: bool = True,
+    ) -> float:
+        """
+        Stop a running strategy.
+
+        market_sell: execute a market sell of any held position.
+        persist:     write is_active=FALSE to DB. Pass False during bot
+                     shutdown so the strategy is restored on next startup.
+        """
         state = self._states.get(symbol)
         if not state:
             raise ValueError(f"No active strategy for {symbol}")
@@ -276,9 +288,13 @@ class StrategyEngine:
             if order and order.get("cost"):
                 sell_value = float(order["cost"])
 
-        await db.deactivate_strategy(symbol)
+        if persist:
+            await db.deactivate_strategy(symbol)
         del self._states[symbol]
-        logger.info("Strategy stopped: %s | sell_value=%.4f", symbol, sell_value)
+        logger.info(
+            "Strategy stopped: %s | sell_value=%.4f | persisted=%s",
+            symbol, sell_value, persist,
+        )
         return sell_value
 
     def get_state(self, symbol: str) -> Optional[StrategyState]:
