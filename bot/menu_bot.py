@@ -33,8 +33,9 @@ logger = logging.getLogger(__name__)
     AWAIT_PA_PAIR,         # PA: trading pair
     AWAIT_PA_CAPITAL,      # PA: capital % per trade
     AWAIT_LS_PAIR,         # LS: trading pair
-    AWAIT_LS_CAPITAL,      # LS: capital % per trade
-) = range(10)
+    AWAIT_LS_TF,           # LS: timeframe (free text)
+    AWAIT_LS_CAPITAL,      # LS: capital % per trade (free text)
+) = range(11)
 
 PA_TIMEFRAMES = ["5m", "15m", "30m", "1h", "4h", "1d"]
 
@@ -853,9 +854,6 @@ async def _cb_paconfirmstop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 
 # ── Liquidity Swings Menu ──────────────────────────────────────────────────────
 
-LS_TIMEFRAMES = ["15m", "30m", "1h", "4h", "1d"]
-
-
 def _kb_ls_main(ctx=None) -> InlineKeyboardMarkup:
     ls_engine = ctx.bot_data.get("ls_engine") if ctx and hasattr(ctx, "bot_data") else None
     symbols   = ls_engine.active_symbols() if ls_engine else []
@@ -867,12 +865,6 @@ def _kb_ls_main(ctx=None) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton("⛔ إيقاف استراتيجية",     callback_data="ls:stop_menu")])
     rows.append([InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="menu:back")])
     return InlineKeyboardMarkup(rows)
-
-
-def _kb_ls_tf() -> InlineKeyboardMarkup:
-    row1 = [InlineKeyboardButton(tf, callback_data=f"lstf:{tf}") for tf in LS_TIMEFRAMES[:3]]
-    row2 = [InlineKeyboardButton(tf, callback_data=f"lstf:{tf}") for tf in LS_TIMEFRAMES[3:]]
-    return InlineKeyboardMarkup([row1, row2, [InlineKeyboardButton("🔙 رجوع", callback_data="ls:back")]])
 
 
 def _kb_ls_strategy(symbol: str) -> InlineKeyboardMarkup:
@@ -970,57 +962,64 @@ async def _recv_ls_pair(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     pair = raw if "/" in raw else (raw.replace("USDT", "/USDT") if raw.endswith("USDT") else raw + "/USDT")
     ctx.user_data["ls_pair"] = pair
     await update.message.reply_text(
-        f"⏱ *التايم فريم — {pair}*\n\nاختر التايم فريم:",
-        reply_markup=_kb_ls_tf(),
+        f"⏱ *التايم فريم — `{pair}`*\n\n"
+        f"اكتب التايم فريم يدوياً:\n"
+        f"مثال: `1m` `5m` `15m` `30m` `1h` `4h` `1d`",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="ls:new")]]),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return AWAIT_LS_TF
+
+
+async def _recv_ls_tf(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _authorized(update):
+        return ConversationHandler.END
+    tf   = (update.message.text or "").strip().lower()
+    pair = ctx.user_data.get("ls_pair", "")
+    ctx.user_data["ls_tf"] = tf
+    await update.message.reply_text(
+        f"💰 *رأس المال — `{pair}` | `{tf}`*\n\n"
+        f"اكتب نسبة رأس المال لكل صفقة من رصيد USDT الحر:\n"
+        f"مثال: `10` أو `25` أو `50`",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="ls:new")]]),
         parse_mode=ParseMode.MARKDOWN,
     )
     return AWAIT_LS_CAPITAL
 
 
-async def _cb_lstf(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    tf   = query.data.split(":")[1]
+async def _recv_ls_capital(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _authorized(update):
+        return ConversationHandler.END
+    text = (update.message.text or "").strip().replace("%", "")
+    try:
+        capital_pct = float(text)
+    except ValueError:
+        await update.message.reply_text(
+            "❌ أدخل رقماً صحيحاً. مثال: `20`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return AWAIT_LS_CAPITAL
+
+    if not (1 <= capital_pct <= 100):
+        await update.message.reply_text("❌ النسبة يجب أن تكون بين 1 و 100.")
+        return AWAIT_LS_CAPITAL
+
     pair = ctx.user_data.get("ls_pair", "")
-    ctx.user_data["ls_tf"] = tf
-
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("10%", callback_data=f"lscap:{pair}:{tf}:10"),
-         InlineKeyboardButton("20%", callback_data=f"lscap:{pair}:{tf}:20"),
-         InlineKeyboardButton("25%", callback_data=f"lscap:{pair}:{tf}:25")],
-        [InlineKeyboardButton("30%", callback_data=f"lscap:{pair}:{tf}:30"),
-         InlineKeyboardButton("50%", callback_data=f"lscap:{pair}:{tf}:50")],
-        [InlineKeyboardButton("🔙 رجوع", callback_data="ls:new")],
-    ])
-    await _edit(query,
-        f"💰 *رأس المال لكل صفقة — `{pair}` | `{tf}`*\n\n"
-        f"اختر النسبة من رصيد USDT الحر لكل صفقة:",
-        kb,
-    )
-    return AWAIT_LS_CAPITAL
-
-
-async def _cb_lscap(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    parts       = query.data.split(":")
-    pair        = parts[1]
-    tf          = parts[2]
-    capital_pct = float(parts[3])
+    tf   = ctx.user_data.get("ls_tf", "1h")
 
     ls_engine = ctx.bot_data.get("ls_engine")
     if not ls_engine:
-        await query.answer("❌ LS engine غير متاح.", show_alert=True)
+        await update.message.reply_text("❌ LS engine غير متاح.")
         return ConversationHandler.END
 
-    await _edit(query,
+    await update.message.reply_text(
         f"⏳ جاري تشغيل Liquidity Swings لـ `{pair}` على `{tf}`…",
-        InlineKeyboardMarkup([]),
+        parse_mode=ParseMode.MARKDOWN,
     )
     try:
         from core.liquidity_swings_strategy_engine import LSParams
         await ls_engine.start(pair, tf, capital_pct, LSParams())
-        await query.edit_message_text(
+        await update.message.reply_text(
             f"✅ *Liquidity Swings مُشغَّلة*\n\n"
             f"🪙 الزوج: `{pair}` | ⏱ `{tf}`\n"
             f"💰 رأس المال/صفقة: `{capital_pct:.0f}%` من الرصيد الحر\n\n"
@@ -1030,7 +1029,7 @@ async def _cb_lscap(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             parse_mode=ParseMode.MARKDOWN,
         )
     except Exception as exc:
-        await query.edit_message_text(f"❌ فشل التشغيل:\n`{exc}`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(f"❌ فشل التشغيل:\n`{exc}`", parse_mode=ParseMode.MARKDOWN)
     return ConversationHandler.END
 
 
@@ -1245,9 +1244,11 @@ def register_menu_handlers(app: Application) -> None:
             AWAIT_LS_PAIR: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_ls_pair),
             ],
+            AWAIT_LS_TF: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_ls_tf),
+            ],
             AWAIT_LS_CAPITAL: [
-                CallbackQueryHandler(_cb_lstf,  pattern=r"^lstf:"),
-                CallbackQueryHandler(_cb_lscap, pattern=r"^lscap:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_ls_capital),
             ],
         },
         fallbacks=[
