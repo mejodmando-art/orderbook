@@ -1104,13 +1104,27 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             InlineKeyboardButton("🏠 القائمة", callback_data="menu_main"),
         ]])
         await update.message.reply_text(
-            f"✅ *تم تعديل النسب — {_fmt_symbol(symbol)}*\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📈 النسبة العلوية: `{state.upper_pct:.1f}%`\n"
-            f"📉 النسبة السفلية: `{new_dn:.1f}%`",
+            f"⏳ جاري إعادة بناء الشبكة بالنسب الجديدة…",
             parse_mode="Markdown",
-            reply_markup=kb,
         )
+        try:
+            await _engine.upgrade_grid(symbol)
+            await update.message.reply_text(
+                f"✅ *تم تعديل النسب وإعادة بناء الشبكة — {_fmt_symbol(symbol)}*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📈 النسبة العلوية: `{state.upper_pct:.1f}%`\n"
+                f"📉 النسبة السفلية: `{new_dn:.1f}%`",
+                parse_mode="Markdown",
+                reply_markup=kb,
+            )
+        except Exception as exc:
+            logger.exception("rebuild after pct edit failed for %s: %s", symbol, exc)
+            await update.message.reply_text(
+                f"⚠️ تم حفظ النسب لكن فشلت إعادة البناء:\n`{exc}`\n"
+                f"يمكنك إعادة المحاولة عبر /upgrade {symbol}",
+                parse_mode="Markdown",
+                reply_markup=kb,
+            )
         return
 
     # ── Amount input ───────────────────────────────────────────────────────────
