@@ -82,8 +82,10 @@ def _kb_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🚀 شبكة جديدة",    callback_data="menu:grid"),
          InlineKeyboardButton("🛑 إيقاف شبكة",    callback_data="menu:grid_stop")],
-        [InlineKeyboardButton("🔄 ترقية الشبكات", callback_data="settings_upgradeall"),
-         InlineKeyboardButton("🎯 Price Action",  callback_data="pa:back")],
+        [InlineKeyboardButton("📊 حالة الشبكات",  callback_data="menu:status"),
+         InlineKeyboardButton("🔄 ترقية الشبكات", callback_data="settings_upgradeall")],
+        [InlineKeyboardButton("🎯 Price Action",  callback_data="pa:back"),
+         InlineKeyboardButton("❓ مساعدة",         callback_data="help:main")],
     ])
 
 
@@ -836,6 +838,112 @@ async def _cb_paconfirmstop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         await query.edit_message_text(f"❌ خطأ:\n`{exc}`", parse_mode=ParseMode.MARKDOWN)
 
 
+# ── Help Menu ──────────────────────────────────────────────────────────────────
+
+_HELP_TOPICS = {
+    "grid": (
+        "🚀 *شبكة Grid — كيف تشتغل؟*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "البوت يضع أوامر شراء وبيع على مستويات سعرية متعددة.\n\n"
+        "📌 *الخطوات:*\n"
+        "1️⃣ اضغط *شبكة جديدة* واختر العملة\n"
+        "2️⃣ حدد مبلغ الاستثمار بـ USDT\n"
+        "3️⃣ اختر عدد الشبكات (كل جانب)\n"
+        "4️⃣ حدد نسبة الخروج العلوي والسفلي\n"
+        "5️⃣ اختر مستوى المخاطرة\n\n"
+        "✅ البوت يعيد بناء الشبكة تلقائياً عند كسر الحدود."
+    ),
+    "pa": (
+        "🎯 *Price Action — كيف تشتغل؟*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "الاستراتيجية تصطاد السيولة وتدخل عند الارتداد.\n\n"
+        "📌 *آلية العمل:*\n"
+        "• يرصد البوت *Equal Highs / Equal Lows*\n"
+        "• ينتظر *Liquidity Sweep* (اختراق وهمي)\n"
+        "• يتأكد بشمعة *Engulfing أو Hammer*\n"
+        "• يدخل بـ Market Order ويضع TP تلقائياً\n\n"
+        "📌 *الإعداد:*\n"
+        "1️⃣ اضغط *Price Action* ← *استراتيجية جديدة*\n"
+        "2️⃣ اختر العملة والتايم فريم ونسبة رأس المال"
+    ),
+    "status": (
+        "📊 *حالة الشبكات — شرح الأرقام*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "📈 *محقق* — الربح الفعلي من صفقات البيع المكتملة\n"
+        "📉 *غير محقق* — الفرق بين سعر الشراء والسعر الحالي\n"
+        "🪙 *الكمية* — ما تحتفظ به البوت حالياً\n"
+        "✅ *بيع* — عدد صفقات البيع المنفذة\n"
+        "🔓 *مفتوح* — عدد الأوامر المعلقة في السوق\n"
+        "⏳ — الشبكة في انتظار إعادة البناء"
+    ),
+    "upgrade": (
+        "🔄 *ترقية الشبكات — متى تستخدمها؟*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "الترقية تلغي الأوامر القديمة وتعيد بناء الشبكة حول السعر الحالي.\n\n"
+        "📌 *استخدمها عندما:*\n"
+        "• تحرك السعر بعيداً عن نطاق الشبكة\n"
+        "• تريد تحديث المستويات بعد تغير السوق\n"
+        "• الشبكة توقفت عن التداول\n\n"
+        "⚠️ *تنبيه:* الترقية تبيع الكميات المحتجزة بسعر السوق."
+    ),
+    "risk": (
+        "⚖️ *مستويات المخاطرة — الفرق بينها*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🟢 *منخفض* — فوارق شبكة أوسع، أوامر أقل، مناسب للسوق الهادئ\n"
+        "🟡 *متوسط* — توازن بين الفوارق وعدد الأوامر\n"
+        "🔴 *مرتفع* — فوارق ضيقة، أوامر أكثر، مناسب للسوق المتذبذب\n\n"
+        "💡 *نصيحة:* ابدأ بـ *متوسط* إذا كنت جديداً."
+    ),
+    "commands": (
+        "⌨️ *الأوامر المتاحة*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "`/menu` — القائمة التفاعلية الرئيسية\n"
+        "`/list` — عرض الشبكات النشطة\n"
+        "`/status BTCUSDT` — تفاصيل شبكة محددة\n"
+        "`/stop BTCUSDT` — إيقاف شبكة\n"
+        "`/upgrade` — ترقية جميع الشبكات\n"
+        "`/upgrade BTCUSDT` — ترقية شبكة محددة\n"
+        "`/start_ai BTCUSDT 500 medium` — تشغيل شبكة سريع\n"
+        "`/help` — هذه المساعدة"
+    ),
+}
+
+def _kb_help_main() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚀 شبكة Grid",        callback_data="help:grid"),
+         InlineKeyboardButton("🎯 Price Action",     callback_data="help:pa")],
+        [InlineKeyboardButton("📊 فهم الأرقام",      callback_data="help:status"),
+         InlineKeyboardButton("🔄 الترقية",          callback_data="help:upgrade")],
+        [InlineKeyboardButton("⚖️ مستويات المخاطرة", callback_data="help:risk"),
+         InlineKeyboardButton("⌨️ الأوامر",          callback_data="help:commands")],
+        [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="menu:back")],
+    ])
+
+def _kb_help_back() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 رجوع للمساعدة", callback_data="help:main"),
+         InlineKeyboardButton("🏠 القائمة",        callback_data="menu:back")],
+    ])
+
+async def _cb_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    topic = query.data.split(":", 1)[1]
+
+    if topic == "main":
+        await _edit(query,
+            "❓ *مركز المساعدة*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "اختر الموضوع اللي تريد تعرف عنه:",
+            _kb_help_main(),
+        )
+        return
+
+    text = _HELP_TOPICS.get(topic)
+    if text:
+        await _edit(query, text, _kb_help_back())
+
+
 # ── Registration ───────────────────────────────────────────────────────────────
 
 def register_menu_handlers(app: Application) -> None:
@@ -898,5 +1006,7 @@ def register_menu_handlers(app: Application) -> None:
     app.add_handler(CallbackQueryHandler(_cb_padetail,      pattern=r"^padetail:"))
     app.add_handler(CallbackQueryHandler(_cb_pastop,        pattern=r"^pastop:"))
     app.add_handler(CallbackQueryHandler(_cb_paconfirmstop, pattern=r"^paconfirmstop:"))
+    # Help
+    app.add_handler(CallbackQueryHandler(_cb_help, pattern=r"^help:"))
 
-    logger.info("Grid + S&R + PA menu handlers registered")
+    logger.info("Grid + S&R + PA + Help menu handlers registered")
