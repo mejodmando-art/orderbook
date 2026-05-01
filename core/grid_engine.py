@@ -710,15 +710,25 @@ class GridEngine:
         if not state.open_orders:
             return
         for order_id, meta in list(state.open_orders.items()):
-            order = await self._client.fetch_order(state.symbol, order_id)
+            # Order may have been removed by a concurrent iteration — skip safely
+            if order_id not in state.open_orders:
+                continue
+            try:
+                order = await self._client.fetch_order(state.symbol, order_id)
+            except Exception as exc:
+                logger.warning("fetch_order failed for %s %s: %s", state.symbol, order_id, exc)
+                continue
             if not order:
                 continue
             status = order.get("status", "")
             if status == "closed":
-                del state.open_orders[order_id]
-                await self._handle_fill(state, meta, order)
+                state.open_orders.pop(order_id, None)
+                try:
+                    await self._handle_fill(state, meta, order)
+                except Exception as exc:
+                    logger.exception("_handle_fill error for %s order %s: %s", state.symbol, order_id, exc)
             elif status == "canceled":
-                del state.open_orders[order_id]
+                state.open_orders.pop(order_id, None)
 
     async def _handle_fill(self, state: GridState, meta: dict, order: dict) -> None:
         side        = meta["side"]
@@ -735,15 +745,15 @@ class GridEngine:
             state.held_qty     += qty
             state.avg_buy_price = total_cost / state.held_qty if state.held_qty else 0.0
 
-            # Place sell one step above the fill (1% higher)
-            sell_price = self._client.round_price(state.symbol, fill_price * (1 + ORDER_PERCENT))
+            # Place sell one step above the fill using actual grid spacing
+            sell_price = self._client.round_price(state.symbol, fill_price + state.params.grid_spacing)
             if self._guard_order_cost(state, sell_price, qty):
                 sell_order = await self._client.place_limit_sell(state.symbol, sell_price, qty)
                 if sell_order:
                     state.open_orders[sell_order["id"]] = {"side": "sell", "price": sell_price, "qty": qty}
 
             # Place next buy one step lower — only if under holdings cap
-            next_buy_price = self._client.round_price(state.symbol, fill_price * (1 - ORDER_PERCENT))
+            next_buy_price = self._client.round_price(state.symbol, fill_price - state.params.grid_spacing)
             if state.held_qty >= max_allowed_qty:
                 logger.warning(
                     "HOLDINGS CAP reached for %s: held=%.6f >= max=%.6f (investment/2=%.2f) — buy skipped",
@@ -775,7 +785,7 @@ class GridEngine:
             state.held_qty      = max(0.0, state.held_qty - qty)
 
             # Place buy one step below the fill — only if under holdings cap
-            buy_price = self._client.round_price(state.symbol, fill_price * (1 - ORDER_PERCENT))
+            buy_price = self._client.round_price(state.symbol, fill_price - state.params.grid_spacing)
             if state.held_qty >= max_allowed_qty:
                 logger.warning(
                     "HOLDINGS CAP reached for %s: held=%.6f >= max=%.6f — buy skipped",
@@ -790,7 +800,7 @@ class GridEngine:
                     state.open_orders[buy_order["id"]] = {"side": "buy", "price": buy_price, "qty": state.params.qty_per_grid}
 
             # Place next sell one step higher
-            next_sell_price = self._client.round_price(state.symbol, fill_price * (1 + ORDER_PERCENT))
+            next_sell_price = self._client.round_price(state.symbol, fill_price + state.params.grid_spacing)
             if (
                 next_sell_price <= state.params.upper
                 and self._guard_order_cost(state, next_sell_price, state.params.qty_per_grid)
