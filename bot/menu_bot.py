@@ -32,10 +32,11 @@ logger = logging.getLogger(__name__)
     AWAIT_ADJUST_INV,      # adjust investment: new amount (free text)
     AWAIT_PA_PAIR,         # PA: trading pair
     AWAIT_PA_CAPITAL,      # PA: capital % per trade
-    AWAIT_LS_PAIR,         # LS: trading pair
-    AWAIT_LS_TF,           # LS: timeframe (free text)
+    AWAIT_LS_SCAN_TF,      # LS: choose timeframe before scan
+    AWAIT_LS_SCAN_RESULT,  # LS: pick coins from scan results
+    AWAIT_LS_MAX_TRADES,   # LS: how many simultaneous trades
     AWAIT_LS_CAPITAL,      # LS: capital % per trade (free text)
-) = range(11)
+) = range(12)
 
 PA_TIMEFRAMES = ["5m", "15m", "30m", "1h", "4h", "1d"]
 
@@ -919,12 +920,20 @@ async def _cb_ls(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int
         return None
 
     if action == "new":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("15m", callback_data="lsscan_tf:15m"),
+             InlineKeyboardButton("30m", callback_data="lsscan_tf:30m"),
+             InlineKeyboardButton("1h",  callback_data="lsscan_tf:1h")],
+            [InlineKeyboardButton("4h",  callback_data="lsscan_tf:4h"),
+             InlineKeyboardButton("1d",  callback_data="lsscan_tf:1d")],
+            [InlineKeyboardButton("🔙 رجوع", callback_data="ls:back")],
+        ])
         await _edit(query,
-            "💧 *Liquidity Swings — استراتيجية جديدة*\n\n"
-            "أرسل اسم العملة (مثال: `BTC` أو `SOLUSDT`):",
-            InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="ls:back")]]),
+            "💧 *Liquidity Swings — مسح السوق*\n\n"
+            "⏱ اختر التايم فريم للتحليل:",
+            kb,
         )
-        return AWAIT_LS_PAIR
+        return AWAIT_LS_SCAN_TF
 
     if action == "list":
         ls_engine = ctx.bot_data.get("ls_engine")
@@ -955,81 +964,143 @@ async def _cb_ls(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int
     return None
 
 
-async def _recv_ls_pair(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    if not _authorized(update):
+async def _cb_lsscan_tf(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """User picked a timeframe — start the scan."""
+    query = update.callback_query
+    await query.answer()
+    tf = query.data.split(":")[1]
+    ctx.user_data["ls_tf"] = tf
+
+    await _edit(query,
+        f"🔍 *جاري مسح Top 100 عملة على `{tf}`…*\n\n"
+        f"⏳ قد يستغرق 1-2 دقيقة، انتظر…",
+        InlineKeyboardMarkup([]),
+    )
+
+    client    = ctx.bot_data.get("client")
+    ls_engine = ctx.bot_data.get("ls_engine")
+    if not client or not ls_engine:
+        await query.edit_message_text("❌ المحرك غير متاح.", parse_mode=ParseMode.MARKDOWN)
         return ConversationHandler.END
-    raw  = (update.message.text or "").strip().upper()
-    pair = raw if "/" in raw else (raw.replace("USDT", "/USDT") if raw.endswith("USDT") else raw + "/USDT")
-    ctx.user_data["ls_pair"] = pair
-    await update.message.reply_text(
-        f"⏱ *التايم فريم — `{pair}`*\n\n"
-        f"اكتب التايم فريم يدوياً:\n"
-        f"مثال: `1m` `5m` `15m` `30m` `1h` `4h` `1d`",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="ls:new")]]),
+
+    from core.ls_scanner import scan_top_coins
+    try:
+        opportunities = await scan_top_coins(client, timeframe=tf, coin_count=100, max_results=20)
+    except Exception as exc:
+        logger.error("LS scan failed: %s", exc)
+        await query.edit_message_text(f"❌ فشل المسح:\n`{exc}`", parse_mode=ParseMode.MARKDOWN)
+        return ConversationHandler.END
+
+    if not opportunities:
+        await query.edit_message_text(
+            f"📭 *لا توجد فرص حالياً على `{tf}`*\n\n"
+            f"لم يجد البوت أي منطقة سيولة نشطة بلمسات كافية.\n"
+            f"جرّب تايم فريم مختلف أو انتظر.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="ls:back")]]),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ConversationHandler.END
+
+    # Store results for next step
+    ctx.user_data["ls_opportunities"] = opportunities
+
+    # Build results message
+    lines = [f"✅ *نتائج المسح — Top {len(opportunities)} فرصة على `{tf}`*\n━━━━━━━━━━━━━━━━━━━━"]
+    for i, opp in enumerate(opportunities, 1):
+        chg = f"+{opp.change_24h:.1f}%" if opp.change_24h >= 0 else f"{opp.change_24h:.1f}%"
+        lines.append(
+            f"{i}. *{opp.symbol}* ({opp.name})\n"
+            f"   💵 `{opp.price:.4f}` | 🔢 لمسات: `{opp.touch_count}` | 24h: `{chg}`\n"
+            f"   🎯 TP: `{opp.tp_price:.4f}` | 🛡 SL: `{opp.sl_price:.4f}`"
+        )
+
+    # Buttons: select all or pick max trades
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("1 صفقة",  callback_data="ls_max:1"),
+         InlineKeyboardButton("3 صفقات", callback_data="ls_max:3"),
+         InlineKeyboardButton("5 صفقات", callback_data="ls_max:5"),
+         InlineKeyboardButton("10 صفقات", callback_data="ls_max:10")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="ls:new")],
+    ])
+
+    await query.edit_message_text(
+        "\n".join(lines) + "\n\n━━━━━━━━━━━━━━━━━━━━\n"
+        "كم صفقة تريد تشغيلها؟ (البوت يأخذ الأفضل بالترتيب)",
+        reply_markup=kb,
         parse_mode=ParseMode.MARKDOWN,
     )
-    return AWAIT_LS_TF
+    return AWAIT_LS_MAX_TRADES
 
 
-async def _recv_ls_tf(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    if not _authorized(update):
-        return ConversationHandler.END
-    tf   = (update.message.text or "").strip().lower()
-    pair = ctx.user_data.get("ls_pair", "")
-    ctx.user_data["ls_tf"] = tf
-    await update.message.reply_text(
-        f"💰 *رأس المال — `{pair}` | `{tf}`*\n\n"
-        f"اكتب نسبة رأس المال لكل صفقة من رصيد USDT الحر:\n"
-        f"مثال: `10` أو `25` أو `50`",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="ls:new")]]),
-        parse_mode=ParseMode.MARKDOWN,
+async def _cb_ls_max(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """User picked max trades — ask for capital per trade."""
+    query = update.callback_query
+    await query.answer()
+    max_trades = int(query.data.split(":")[1])
+    ctx.user_data["ls_max_trades"] = max_trades
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("5%",  callback_data="ls_cap:5"),
+         InlineKeyboardButton("10%", callback_data="ls_cap:10"),
+         InlineKeyboardButton("15%", callback_data="ls_cap:15")],
+        [InlineKeyboardButton("20%", callback_data="ls_cap:20"),
+         InlineKeyboardButton("25%", callback_data="ls_cap:25"),
+         InlineKeyboardButton("30%", callback_data="ls_cap:30")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="ls:new")],
+    ])
+    await _edit(query,
+        f"💰 *رأس المال لكل صفقة*\n\n"
+        f"عدد الصفقات: `{max_trades}`\n\n"
+        f"اختر نسبة رأس المال من رصيد USDT الحر لكل صفقة:",
+        kb,
     )
     return AWAIT_LS_CAPITAL
 
 
-async def _recv_ls_capital(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    if not _authorized(update):
-        return ConversationHandler.END
-    text = (update.message.text or "").strip().replace("%", "")
-    try:
-        capital_pct = float(text)
-    except ValueError:
-        await update.message.reply_text(
-            "❌ أدخل رقماً صحيحاً. مثال: `20`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return AWAIT_LS_CAPITAL
-
-    if not (1 <= capital_pct <= 100):
-        await update.message.reply_text("❌ النسبة يجب أن تكون بين 1 و 100.")
-        return AWAIT_LS_CAPITAL
-
-    pair = ctx.user_data.get("ls_pair", "")
-    tf   = ctx.user_data.get("ls_tf", "1h")
+async def _cb_ls_cap(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """User picked capital % — launch strategies."""
+    query = update.callback_query
+    await query.answer()
+    capital_pct = float(query.data.split(":")[1])
+    max_trades  = int(ctx.user_data.get("ls_max_trades", 1))
+    tf          = ctx.user_data.get("ls_tf", "1h")
+    opportunities = ctx.user_data.get("ls_opportunities", [])
 
     ls_engine = ctx.bot_data.get("ls_engine")
     if not ls_engine:
-        await update.message.reply_text("❌ LS engine غير متاح.")
+        await query.edit_message_text("❌ LS engine غير متاح.", parse_mode=ParseMode.MARKDOWN)
         return ConversationHandler.END
 
-    await update.message.reply_text(
-        f"⏳ جاري تشغيل Liquidity Swings لـ `{pair}` على `{tf}`…",
+    selected = opportunities[:max_trades]
+
+    await _edit(query,
+        f"⏳ جاري تشغيل {len(selected)} استراتيجية…",
+        InlineKeyboardMarkup([]),
+    )
+
+    from core.liquidity_swings_strategy_engine import LSParams
+    started, failed = [], []
+    for opp in selected:
+        # Skip already running
+        if opp.symbol in ls_engine.active_symbols():
+            started.append(f"⚠️ `{opp.symbol}` — يعمل بالفعل")
+            continue
+        try:
+            await ls_engine.start(opp.symbol, tf, capital_pct, LSParams())
+            started.append(f"✅ `{opp.symbol}` — لمسات: {opp.touch_count}")
+        except Exception as exc:
+            failed.append(f"❌ `{opp.symbol}` — {exc}")
+
+    lines = [
+        f"🚀 *تم تشغيل Liquidity Swings*\n━━━━━━━━━━━━━━━━━━━━",
+        f"⏱ التايم فريم: `{tf}` | 💰 رأس المال/صفقة: `{capital_pct:.0f}%`\n",
+    ] + started + (failed if failed else [])
+
+    await query.edit_message_text(
+        "\n".join(lines),
+        reply_markup=_kb_ls_main(ctx),
         parse_mode=ParseMode.MARKDOWN,
     )
-    try:
-        from core.liquidity_swings_strategy_engine import LSParams
-        await ls_engine.start(pair, tf, capital_pct, LSParams())
-        await update.message.reply_text(
-            f"✅ *Liquidity Swings مُشغَّلة*\n\n"
-            f"🪙 الزوج: `{pair}` | ⏱ `{tf}`\n"
-            f"💰 رأس المال/صفقة: `{capital_pct:.0f}%` من الرصيد الحر\n\n"
-            f"🔍 البوت يراقب الآن مناطق السيولة…\n"
-            f"سيُرسل إشعار فور اكتشاف إشارة.",
-            reply_markup=_kb_ls_strategy(pair),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    except Exception as exc:
-        await update.message.reply_text(f"❌ فشل التشغيل:\n`{exc}`", parse_mode=ParseMode.MARKDOWN)
     return ConversationHandler.END
 
 
@@ -1241,14 +1312,14 @@ def register_menu_handlers(app: Application) -> None:
             CallbackQueryHandler(_cb_ls, pattern=r"^ls:new$"),
         ],
         states={
-            AWAIT_LS_PAIR: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_ls_pair),
+            AWAIT_LS_SCAN_TF: [
+                CallbackQueryHandler(_cb_lsscan_tf, pattern=r"^lsscan_tf:"),
             ],
-            AWAIT_LS_TF: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_ls_tf),
+            AWAIT_LS_MAX_TRADES: [
+                CallbackQueryHandler(_cb_ls_max, pattern=r"^ls_max:"),
             ],
             AWAIT_LS_CAPITAL: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_ls_capital),
+                CallbackQueryHandler(_cb_ls_cap, pattern=r"^ls_cap:"),
             ],
         },
         fallbacks=[
