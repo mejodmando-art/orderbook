@@ -80,12 +80,11 @@ def _main_menu_text(ctx=None) -> str:
 
 def _kb_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 شبكة جديدة",    callback_data="menu:grid"),
-         InlineKeyboardButton("🛑 إيقاف شبكة",    callback_data="menu:grid_stop")],
-        [InlineKeyboardButton("📊 حالة الشبكات",  callback_data="menu:status"),
-         InlineKeyboardButton("🔄 ترقية الشبكات", callback_data="settings_upgradeall")],
-        [InlineKeyboardButton("🎯 Price Action",  callback_data="pa:back"),
-         InlineKeyboardButton("❓ مساعدة",         callback_data="help:main")],
+        [InlineKeyboardButton("🚀 شبكة جديدة",         callback_data="menu:grid"),
+         InlineKeyboardButton("📊 متابعة وإدارة الشبكات", callback_data="menu:manage")],
+        [InlineKeyboardButton("🔄 ترقية الشبكات",      callback_data="settings_upgradeall"),
+         InlineKeyboardButton("🎯 Price Action",       callback_data="pa:back")],
+        [InlineKeyboardButton("❓ مساعدة",              callback_data="help:main")],
     ])
 
 
@@ -149,6 +148,17 @@ async def _cb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[i
         rows = [[InlineKeyboardButton(f"🛑 {s}", callback_data=f"gridstop:{s}")] for s in symbols]
         rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="menu:back")])
         await _edit(query, "🛑 *اختر الشبكة للإيقاف:*", InlineKeyboardMarkup(rows))
+        return None
+
+    if action == "manage":
+        engine  = ctx.bot_data.get("engine")
+        symbols = engine.active_symbols() if engine else []
+        if not symbols:
+            await query.answer("لا توجد شبكات نشطة حالياً.", show_alert=True)
+            return None
+        rows = [[InlineKeyboardButton(f"⚙️ {s}", callback_data=f"detail_{s}")] for s in symbols]
+        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="menu:back")])
+        await _edit(query, "📊 *اختر الشبكة للمتابعة والإدارة:*", InlineKeyboardMarkup(rows))
         return None
 
     return None
