@@ -73,11 +73,15 @@ async def _create_tables() -> None:
                 held_qty        NUMERIC DEFAULT 0,
                 realized_pnl    NUMERIC DEFAULT 0,
                 sell_count      INTEGER DEFAULT 0,
+                upper_pct       NUMERIC NOT NULL DEFAULT 3.0,
+                lower_pct       NUMERIC NOT NULL DEFAULT 3.0,
                 started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 is_active       BOOLEAN NOT NULL DEFAULT TRUE,
                 extra           JSONB DEFAULT '{}'
             );
+            ALTER TABLE active_grids ADD COLUMN IF NOT EXISTS upper_pct NUMERIC NOT NULL DEFAULT 3.0;
+            ALTER TABLE active_grids ADD COLUMN IF NOT EXISTS lower_pct NUMERIC NOT NULL DEFAULT 3.0;
 
             CREATE TABLE IF NOT EXISTS trade_history (
                 id          SERIAL PRIMARY KEY,
@@ -131,6 +135,8 @@ async def upsert_grid(data: dict) -> int:
         "grid_spacing":     float(data.get("grid_spacing", 0)),
         "current_atr":      float(data.get("current_atr", 0)) if data.get("current_atr") is not None else None,
         "is_active":        bool(data.get("is_active", True)),
+        "upper_pct":        float(data.get("upper_pct", 3.0)),
+        "lower_pct":        float(data.get("lower_pct", 3.0)),
     }
 
     async with pool.acquire() as conn:
@@ -138,10 +144,11 @@ async def upsert_grid(data: dict) -> int:
             """
             INSERT INTO active_grids
                 (symbol, risk_level, total_investment, lower_price, upper_price,
-                 grid_count, grid_spacing, current_atr, is_active)
+                 grid_count, grid_spacing, current_atr, is_active, upper_pct, lower_pct)
             VALUES
                 ($1, $2, $3::numeric, $4::numeric, $5::numeric,
-                 $6::integer, $7::numeric, $8::numeric, $9::boolean)
+                 $6::integer, $7::numeric, $8::numeric, $9::boolean,
+                 $10::numeric, $11::numeric)
             ON CONFLICT (symbol) DO UPDATE SET
                 risk_level       = COALESCE(EXCLUDED.risk_level,       active_grids.risk_level),
                 total_investment = CASE WHEN $3::numeric > 0
@@ -161,6 +168,12 @@ async def upsert_grid(data: dict) -> int:
                                         ELSE active_grids.grid_spacing END,
                 current_atr      = COALESCE($8::numeric, active_grids.current_atr),
                 is_active        = EXCLUDED.is_active,
+                upper_pct        = CASE WHEN $10::numeric > 0
+                                        THEN $10::numeric
+                                        ELSE active_grids.upper_pct END,
+                lower_pct        = CASE WHEN $11::numeric > 0
+                                        THEN $11::numeric
+                                        ELSE active_grids.lower_pct END,
                 updated_at       = NOW()
             RETURNING id
             """,
@@ -173,6 +186,8 @@ async def upsert_grid(data: dict) -> int:
             row["grid_spacing"],
             row["current_atr"],
             row["is_active"],
+            row["upper_pct"],
+            row["lower_pct"],
         )
     return grid_id
 

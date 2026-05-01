@@ -849,6 +849,8 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
                 "grid_count":   params.grid_count,
                 "grid_spacing": params.grid_spacing,
                 "current_atr":  0.0,
+                "upper_pct":    state.upper_pct,
+                "lower_pct":    state.lower_pct,
             })
             await _engine._place_initial_orders(state, price)
             kb = InlineKeyboardMarkup([
@@ -1037,6 +1039,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
                 "grid_count":   params.grid_count,
                 "grid_spacing": params.grid_spacing,
                 "current_atr":  0.0,
+                "upper_pct":    state.upper_pct,
+                "lower_pct":    state.lower_pct,
             })
             await _engine._place_initial_orders(state, price)
             kb = InlineKeyboardMarkup([[

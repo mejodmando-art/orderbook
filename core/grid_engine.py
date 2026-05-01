@@ -206,6 +206,8 @@ class GridEngine:
             "grid_spacing":     params.grid_spacing,
             "current_atr":      0.0,
             "is_active":        True,
+            "upper_pct":        upper_pct,
+            "lower_pct":        lower_pct,
         })
         state.grid_id = grid_id
 
@@ -701,6 +703,8 @@ class GridEngine:
             "grid_count":   params.grid_count,
             "grid_spacing": params.grid_spacing,
             "current_atr":  0.0,
+            "upper_pct":    state.upper_pct,
+            "lower_pct":    state.lower_pct,
         })
         await self._place_initial_orders(state, price)
 

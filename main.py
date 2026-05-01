@@ -72,6 +72,9 @@ async def _on_startup(application) -> None:
                     symbol=symbol,
                     total_investment=float(row["total_investment"]),
                     risk=row["risk_level"],
+                    num_grids=int(row["grid_count"]) // 2,
+                    upper_pct=float(row.get("upper_pct") or 3.0),
+                    lower_pct=float(row.get("lower_pct") or 3.0),
                 )
                 recovered += 1
             except Exception as exc:
