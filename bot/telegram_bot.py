@@ -153,40 +153,27 @@ def _reports_kb(symbol: str) -> InlineKeyboardMarkup:
 
 
 def _fmt_report(r: dict) -> str:
-    total = r['total_profit']
-    pnl_icon = "📈" if total >= 0 else "📉"
-    pnl_sign = "+" if total >= 0 else ""
+    total     = r['total_profit']
+    pnl_icon  = "📈" if total >= 0 else "📉"
+    pnl_sign  = "+" if total >= 0 else ""
     risk_icons = {"low": "🟢 منخفض", "medium": "🟡 متوسط", "high": "🔴 مرتفع"}
+    n = r['grid_count'] // 2
     return (
-        f"╔══════════════════════╗\n"
-        f"║  📊 *{_fmt_symbol(r['symbol'])}*  ║\n"
-        f"╚══════════════════════╝\n\n"
-        f"💰 *الاستثمار والنطاق*\n"
+        f"📊 *{_fmt_symbol(r['symbol'])}*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💵 مخصص: `${r['total_investment']:.2f}` USDT\n"
-        f"📐 النطاق: `{r['lower']:.4f}` ↔ `{r['upper']:.4f}`\n"
-        f"🔢 شبكات: `{r['grid_count'] // 2}` شراء + `{r['grid_count'] // 2}` بيع\n"
-        f"📏 فارق: `{r['grid_spacing']:.4f}` | ميزانية/شبكة: `{r.get('qty_per_grid_usdt', 0):.2f}$`\n\n"
-        f"💹 *السعر والمركز*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💵 السعر الحالي: `{r['current_price']:.4f}`\n"
-        f"📦 متوسط الشراء: `{r['avg_buy_price']:.4f}`\n"
-        f"🪙 الكمية: `{r['held_qty']:.6f}`\n\n"
-        f"📋 *الأوامر المفتوحة*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🟢 شراء: `{r.get('active_buys', 0)}` | 🔴 بيع: `{r.get('active_sells', 0)}` | 🔓 إجمالي: `{r['open_orders']}`\n"
-        f"✅ صفقات بيع منفذة: `{r['sell_count']}`\n\n"
-        f"{pnl_icon} *الأرباح*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💹 ربح الشبكة: `${r['grid_profit']:+.4f}`\n"
-        f"📈 غير محقق: `${r['unrealised_pnl']:+.4f}`\n"
-        f"✅ محقق: `${r['realized_pnl']:+.4f}`\n"
-        f"🏆 *الإجمالي: `${pnl_sign}{r['total_profit']:.4f}`*\n\n"
-        f"📊 *الأداء*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📅 أيام التشغيل: `{r['days_running']:.1f}`\n"
-        f"📊 APY: `{r['apy']:.2f}%` | APY الشبكة: `{r['grid_apy']:.2f}%`\n"
-        f"⚖️ المخاطرة: {risk_icons.get(r['risk'], r['risk'])}"
+        f"💵 رصيد مستثمر:  `${r['total_investment']:.2f}` USDT\n"
+        f"⚖️ مخاطرة: {risk_icons.get(r['risk'], r['risk'])}\n\n"
+        f"⚙️ *إعدادات الشبكة*\n"
+        f"شبكات: `{n}` شراء + `{n}` بيع\n"
+        f"نطاق:  `{r['lower']:.4f}` ← `{r['upper']:.4f}`\n"
+        f"فارق:  `{r['grid_spacing']:.4f}` | لكل شبكة: `${r.get('qty_per_grid_usdt', 0):.2f}`\n\n"
+        f"💹 *السعر الحالي:* `{r['current_price']:.4f}`\n"
+        f"🟢 أوامر شراء: `{r.get('active_buys', 0)}` | 🔴 بيع: `{r.get('active_sells', 0)}`\n"
+        f"✅ صفقات منفذة: `{r['sell_count']}`\n\n"
+        f"{pnl_icon} *الربح*\n"
+        f"محقق:     `${r['realized_pnl']:+.4f}`\n"
+        f"غير محقق: `${r['unrealised_pnl']:+.4f}`\n"
+        f"*الإجمالي: `${pnl_sign}{r['total_profit']:.4f}`*"
     )
 
 
