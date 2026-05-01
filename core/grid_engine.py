@@ -2,25 +2,31 @@
 Fixed-Spacing Grid Engine.
 
 Startup:
-  - Places MAX_ORDERS_PER_SIDE (3) limit buys below price, each 2.5% apart.
-  - Places MAX_ORDERS_PER_SIDE (3) limit sells above price, each 2.5% apart.
-  - No upfront base-currency purchase; capital is deployed only as orders fill.
-  - Each order size = total_investment / (MAX_ORDERS_PER_SIDE * 2) / current_price.
+  - User sets upper_pct% and lower_pct% to define the grid range.
+  - User sets num_grids (orders per side); default is MAX_ORDERS_PER_SIDE (3).
+  - Places num_grids limit buys below price and num_grids limit sells above price,
+    evenly spaced within the user-defined range.
+  - Market-buys half the investment upfront as the initial position.
+  - Each order size = total_investment / (num_grids * 2) / current_price.
 
 Fill handling:
-  - Buy filled  → place sell at fill_price × 1.025, then next buy lower (if under holdings cap).
-  - Sell filled → place buy at fill_price × 0.975 (if under holdings cap), then next sell higher.
-
-Holdings cap:
-  - Max allowed qty = (total_investment / 2) / current_price.
-  - No new buy orders are placed once this cap is reached.
+  - Buy filled  → place sell one grid_spacing above fill price.
+  - Sell filled → place buy one grid_spacing below fill price.
+  - Holdings cap = (total_investment / 2) / current_price; no new buys beyond this.
 
 Range & re-centering:
-  - Fixed: lower = price × (1 - 3 × 0.025) = price × 0.925
-           upper = price × (1 + 3 × 0.025) = price × 1.075
-  - If the live price escapes the range (price < lower or price > upper),
-    all orders are cancelled and the grid is rebuilt around the new price.
-  - Checked every FILL_POLL_INTERVAL seconds (same cycle as fill polling).
+  - Breakout triggers when price exceeds upper_pct% above params.upper
+    or lower_pct% below params.lower.
+  - Rebuild is deferred until the current 1-minute candle closes to avoid
+    reacting to wicks that immediately reverse.
+
+Min-order enforcement:
+  - Every order is validated against the exchange's min_amount and min_cost
+    before placement; rejected orders are logged and skipped silently.
+
+Balance drift detection:
+  - Every 60 s the engine compares held_qty against the real exchange balance.
+  - If drift exceeds 1% of held_qty, the user is prompted to sync.
 """
 import asyncio
 import logging
@@ -735,9 +741,22 @@ class GridEngine:
                 state.open_orders.pop(order_id, None)
 
     async def _handle_fill(self, state: GridState, meta: dict, order: dict) -> None:
-        side        = meta["side"]
-        fill_price  = float(order.get("average") or order.get("price") or meta["price"])
-        qty         = float(order.get("filled") or meta["qty"])
+        side = meta["side"]
+        try:
+            fill_price = float(order.get("average") or order.get("price") or meta["price"])
+            qty        = float(order.get("filled") or meta["qty"])
+        except (TypeError, ValueError) as exc:
+            logger.error(
+                "_handle_fill: could not parse fill data for %s order %s: %s — skipping",
+                state.symbol, order.get("id", "?"), exc,
+            )
+            return
+        if fill_price <= 0 or qty <= 0:
+            logger.error(
+                "_handle_fill: invalid fill_price=%.6f qty=%.6f for %s — skipping",
+                fill_price, qty, state.symbol,
+            )
+            return
         pnl = 0.0
 
         # Max allowed holdings = half the total investment at current fill price
