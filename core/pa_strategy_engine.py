@@ -192,7 +192,7 @@ class PAStrategyEngine:
         await self._client.cancel_all_orders(symbol)
 
         sell_value = 0.0
-        if market_sell and state.held_qty > 0 and state.direction == "buy":
+        if market_sell and state.held_qty > 0:
             order = await self._client.market_sell_qty(symbol, state.held_qty)
             if order and order.get("cost"):
                 sell_value = float(order["cost"])
@@ -300,15 +300,17 @@ class PAStrategyEngine:
         if state.held_qty > 0:
             return
 
+        # Spot only: skip sell/short signals — we can only buy what we own
+        if signal.direction != "buy":
+            logger.info("PA signal ignored (sell/short not supported on spot): %s", symbol)
+            return
+
         current_price = await self._client.get_current_price(symbol)
         qty = await self._calc_qty(state, current_price)
         if qty <= 0:
             return
 
-        if signal.direction == "buy":
-            order = await self._client.market_buy_qty(symbol, qty)
-        else:
-            order = await self._client.market_sell_qty(symbol, qty)
+        order = await self._client.market_buy_qty(symbol, qty)
 
         if not order:
             logger.error("PA market order failed for %s", symbol)
