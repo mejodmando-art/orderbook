@@ -1,7 +1,6 @@
-# AI Dynamic Grid Bot — MEXC
+# Grid Bot — MEXC Spot
 
 Telegram-controlled grid trading bot for MEXC spot market.
-Automatically adjusts grid range and count using ATR (Average True Range), mirroring KuCoin AI Plus Bot behaviour.
 
 ## Quick Start
 
@@ -13,32 +12,40 @@ pip install -r requirements.txt
 python main.py
 ```
 
-## Telegram Commands
+## Telegram
+
+Send `/menu` to open the interactive control panel.
 
 | Command | Description |
 |---|---|
-| `/start_ai BTCUSDT 500 medium` | Start AI grid (symbol, amount USDT, risk: low/medium/high) |
-| `/status BTCUSDT` | Full profit report |
-| `/stop BTCUSDT` | Stop bot and market-sell all holdings |
-| `/list` | Show all active pairs |
-| `/help` | Help message |
-
-## Risk Levels
-
-| Level | ATR Multiplier | Grids |
-|---|---|---|
-| low | 1.5× | 5–10 |
-| medium | 2.0× | 8–20 |
-| high | 3.0× | 15–30 |
+| `/menu` | Interactive control panel |
+| `/list` | Active grids |
+| `/status BTCUSDT` | Profit report for a grid |
+| `/stop BTCUSDT` | Stop grid and market-sell holdings |
+| `/upgrade` | Rebuild all grids at current price |
 
 ## How It Works
 
-1. Fetches current price and computes ATR from 15m candles.
-2. Derives grid range (`price ± ATR × multiplier`) and grid count.
-3. Places limit buy orders below price, limit sell orders above.
-4. Every 5 minutes: recomputes ATR. If price escapes range by ≥ 1× ATR, cancels all orders and rebuilds grid around new price.
-5. When a buy fills → places matching sell one grid up. When a sell fills → places matching buy one grid down.
+**Grid Bot**
+- User sets: symbol, investment (USDT), grids per side, upper % and lower % range, risk level.
+- Places `n` limit buy orders below price and `n` limit sell orders above, evenly spaced within the range.
+- When a buy fills → places a limit sell one spacing above. When a sell fills → places a limit buy one spacing below.
+- If price breaks out beyond the user-defined range, waits for the 1-minute candle to close then rebuilds the grid around the new price.
+- Balance drift (external purchases) is detected every 60 s and the user is prompted to sync.
 
-## Deployment (Railway)
+**Price Action Bot**
+- Spot only: buy signals only (no short/sell entries).
+- Detects Equal Highs/Lows, Liquidity Sweep, and confirmation candle (Engulfing/Hammer).
+- Enters with a market buy, places a limit sell at the TP level immediately after.
 
-Set environment variables in Railway dashboard, then deploy. The `Procfile` runs `python main.py` as a worker dyno.
+## Risk Levels
+
+| Level | Effect |
+|---|---|
+| low | Wider grid spacing, fewer orders |
+| medium | Balanced spacing and order count |
+| high | Tighter spacing, more orders |
+
+## Deployment
+
+Set environment variables, then run `python main.py`. The `Procfile` runs it as a worker process (Railway/Heroku compatible).

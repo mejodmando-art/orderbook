@@ -163,6 +163,8 @@ class GridState:
     running:          bool  = True
     # set to True while waiting for the 1-min candle to close after a breakout
     _pending_rebuild: bool  = field(default=False, repr=False)
+    # tracked task for _wait_and_rebuild so it can be cancelled on grid stop
+    _rebuild_task:    object = field(default=None, repr=False)
     # set to True while waiting for user response to a balance-sync prompt
     _pending_sync:    bool  = field(default=False, repr=False)
 
@@ -235,6 +237,17 @@ class GridEngine:
             raise ValueError(f"No active grid for {symbol}")
 
         state.running = False
+
+        # Cancel pending rebuild task if one is waiting for candle close
+        if state._rebuild_task and not state._rebuild_task.done():
+            state._rebuild_task.cancel()
+            try:
+                await state._rebuild_task
+            except asyncio.CancelledError:
+                pass
+        state._rebuild_task = None
+        state._pending_rebuild = False
+
         task = self._tasks.pop(symbol, None)
         if task:
             task.cancel()
@@ -446,8 +459,8 @@ class GridEngine:
             state.params.lower * (1 - state.lower_pct / 100),
         )
         state._pending_rebuild = True
-        # Fire-and-forget: wait for 1-min candle close then rebuild
-        asyncio.ensure_future(self._wait_and_rebuild(state, direction))
+        # Track the task so it can be cancelled if the grid stops
+        state._rebuild_task = asyncio.ensure_future(self._wait_and_rebuild(state, direction))
 
     async def _wait_and_rebuild(self, state: GridState, direction: str) -> None:
         """
