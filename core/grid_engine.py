@@ -98,19 +98,29 @@ def derive_grid_params(
     client: MexcClient,
     symbol: str,
     num_grids: int = MAX_ORDERS_PER_SIDE,
+    upper_pct: float = 3.0,
+    lower_pct: float = 3.0,
 ) -> GridParams:
     """
-    Build fixed-spacing grid params.
-    - num_grids: orders per side (buys = sells = num_grids).
-    - Range: ±(num_grids × ORDER_PERCENT) around current_price.
+    Build fixed-spacing grid params driven by the user's upper/lower percentages.
+
+    - upper_pct: the top sell order sits exactly upper_pct% above current price.
+    - lower_pct: the bottom buy order sits exactly lower_pct% below current price.
+    - num_grids orders per side are spaced evenly inside those bounds.
     - qty_per_grid = total_investment / (num_grids*2) / current_price,
       capped at (total_investment / 2) / current_price.
     """
-    n            = max(1, num_grids)
-    grid_count   = n * 2
-    lower        = current_price * (1 - n * ORDER_PERCENT)
-    upper        = current_price * (1 + n * ORDER_PERCENT)
-    grid_spacing = current_price * ORDER_PERCENT   # nominal step for reference
+    n          = max(1, num_grids)
+    grid_count = n * 2
+
+    upper = current_price * (1 + upper_pct / 100)
+    lower = current_price * (1 - lower_pct / 100)
+
+    # Spacing = range / num_grids so the outermost order hits the bound exactly
+    upper_spacing = (upper - current_price) / n
+    lower_spacing = (current_price - lower) / n
+    # Use the average spacing as the nominal grid_spacing (for reports/fills)
+    grid_spacing  = (upper_spacing + lower_spacing) / 2
 
     raw_qty      = total_investment / grid_count / current_price
     max_qty      = (total_investment / 2) / current_price
@@ -175,7 +185,10 @@ class GridEngine:
             raise ValueError(f"Grid already running for {symbol}")
 
         price  = await self._client.get_current_price(symbol)
-        params = derive_grid_params(price, total_investment, self._client, symbol, num_grids=num_grids)
+        params = derive_grid_params(
+            price, total_investment, self._client, symbol,
+            num_grids=num_grids, upper_pct=upper_pct, lower_pct=lower_pct,
+        )
 
         state = GridState(
             symbol=symbol, risk=risk, total_investment=total_investment,
@@ -336,16 +349,19 @@ class GridEngine:
                 )
 
         # ── Step 2: limit buy orders below fill price ──────────────────────────
-        n = p.grid_count // 2
+        n             = p.grid_count // 2
+        buy_spacing   = (fill_price - p.lower) / n   # even spacing down to lower bound
+        sell_spacing  = (p.upper - fill_price) / n   # even spacing up to upper bound
+
         for i in range(1, n + 1):
-            level = self._client.round_price(state.symbol, fill_price * (1 - i * ORDER_PERCENT))
+            level = self._client.round_price(state.symbol, fill_price - i * buy_spacing)
             order = await self._client.place_limit_buy(state.symbol, level, p.qty_per_grid)
             if order:
                 state.open_orders[order["id"]] = {"side": "buy", "price": level, "qty": p.qty_per_grid}
 
         # ── Step 3: limit sell orders above fill price ─────────────────────────
         for i in range(1, n + 1):
-            level = self._client.round_price(state.symbol, fill_price * (1 + i * ORDER_PERCENT))
+            level = self._client.round_price(state.symbol, fill_price + i * sell_spacing)
             order = await self._client.place_limit_sell(state.symbol, level, p.qty_per_grid)
             if order:
                 state.open_orders[order["id"]] = {"side": "sell", "price": level, "qty": p.qty_per_grid}
@@ -673,7 +689,10 @@ class GridEngine:
         await self._client.cancel_all_orders(state.symbol)
         state.open_orders.clear()
         n      = state.params.grid_count // 2
-        params = derive_grid_params(price, state.total_investment, self._client, state.symbol, num_grids=n)
+        params = derive_grid_params(
+            price, state.total_investment, self._client, state.symbol,
+            num_grids=n, upper_pct=state.upper_pct, lower_pct=state.lower_pct,
+        )
         state.params = params
         await db.upsert_grid({
             "symbol":       state.symbol,
