@@ -3,8 +3,14 @@ Entry point. Validates env, initialises DB + MEXC client, wires the
 GridEngine to the Telegram bot, then starts long-polling.
 """
 import logging
+from decimal import Decimal
 
-from config.settings import LOG_LEVEL, validate_env
+from config.settings import (
+    LOG_LEVEL, validate_env,
+    BSC_WS_RPC_URL, BSC_HTTP_RPC_URL,
+    COPY_TARGET_WALLET, MY_BSC_PRIVATE_KEY,
+    COPY_TRADE_USDT, COPY_SELLS, COPY_TRADE_ENABLED,
+)
 from core.mexc_client import MexcClient
 from core.grid_engine import GridEngine, set_notifiers as grid_set_notifiers
 from bot.telegram_bot import (
@@ -54,6 +60,12 @@ async def _on_startup(application) -> None:
     client = application.bot_data["client"]
     await client.load_markets()
 
+    # Start copy-trade engine if configured
+    copy_engine = application.bot_data.get("copy_engine")
+    if copy_engine is not None:
+        await copy_engine.start()
+        logger.info("CopyTradeEngine started")
+
     engine: GridEngine = application.bot_data["engine"]
     active = await get_all_active_grids()
     recovered, upgraded, failed = 0, 0, 0
@@ -99,6 +111,10 @@ async def _on_shutdown(application) -> None:
         except Exception as exc:
             logger.error("Error stopping grid %s: %s", symbol, exc)
 
+    copy_engine = application.bot_data.get("copy_engine")
+    if copy_engine is not None:
+        await copy_engine.stop()
+
     await client.close()
     await close_db()
     logger.info("Shutdown complete.")
@@ -130,6 +146,38 @@ def main() -> None:
 
     app.bot_data["client"] = client
     app.bot_data["engine"] = engine
+
+    # Wire copy-trade engine if all required vars are present
+    if BSC_WS_RPC_URL and BSC_HTTP_RPC_URL and MY_BSC_PRIVATE_KEY:
+        from core.copy_trade_engine import CopyTradeEngine, set_copy_notifiers
+        from bot.copy_bot import (
+            register_copy_handlers, set_copy_engine,
+            notify_copy_buy, notify_copy_sell, notify_copy_err,
+        )
+
+        copy_engine = CopyTradeEngine(
+            ws_rpc_url    = BSC_WS_RPC_URL,
+            http_rpc_url  = BSC_HTTP_RPC_URL,
+            target_wallet = COPY_TARGET_WALLET,
+            my_private_key= MY_BSC_PRIVATE_KEY,
+            trade_usdt    = Decimal(str(COPY_TRADE_USDT)),
+            copy_sells    = COPY_SELLS,
+            enabled       = COPY_TRADE_ENABLED,
+        )
+
+        set_copy_notifiers(
+            buy  = notify_copy_buy,
+            sell = notify_copy_sell,
+            err  = notify_copy_err,
+        )
+        set_copy_engine(copy_engine)
+        register_copy_handlers(app)
+
+        app.bot_data["copy_engine"] = copy_engine
+        logger.info("CopyTradeEngine configured — target: %s", COPY_TARGET_WALLET[:10])
+    else:
+        logger.warning("CopyTradeEngine not started — missing BSC env vars")
+
     app.post_init     = _on_startup
     app.post_shutdown = _on_shutdown
 

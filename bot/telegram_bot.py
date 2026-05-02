@@ -207,7 +207,12 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "`/upgrade` — إعادة بناء جميع الشبكات بالسعر الحالي\n"
         "`/upgrade BTCUSDT` — إعادة بناء شبكة محددة\n"
         "`/mute [SYMBOL]` — كتم الإشعارات\n"
-        "`/unmute [SYMBOL]` — تفعيل الإشعارات",
+        "`/unmute [SYMBOL]` — تفعيل الإشعارات\n\n"
+        "*نسخ التجارة (BSC):*\n"
+        "`/copy_status` — حالة محرك النسخ\n"
+        "`/copy_start` — تفعيل النسخ\n"
+        "`/copy_stop` — إيقاف مؤقت\n"
+        "`/copy_history` — آخر الصفقات المنسوخة",
         parse_mode="Markdown",
     )
 
@@ -1515,9 +1520,11 @@ def build_application(engine, client) -> Application:
     from bot.menu_bot import register_menu_handlers
     register_menu_handlers(app)
 
+    # Copy-trade handlers registered lazily from main.py via register_copy_handlers()
+
     app.add_handler(CallbackQueryHandler(
         handle_callback,
-        pattern=r"^(?!menu:|profit:|stop:|grid:|gridrisk:|gridstop:|adjinv:|adjinv_show:)",
+        pattern=r"^(?!menu:|profit:|stop:|grid:|gridrisk:|gridstop:|adjinv:|adjinv_show:|copy_)",
     ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app

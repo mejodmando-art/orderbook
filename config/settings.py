@@ -29,6 +29,18 @@ ALLOWED_USER_IDS: set[int] = (
 ORDER_SLEEP_SECONDS: float = 0.25   # pause between REST calls to respect rate limits
 FILL_POLL_INTERVAL: int = 10        # seconds between fill-check cycles
 
+# ── Copy-trade (BSC / PancakeSwap V2) ─────────────────────────────────────────
+BSC_WS_RPC_URL: str   = os.getenv("BSC_WS_RPC_URL", "")    # Ankr WebSocket endpoint
+BSC_HTTP_RPC_URL: str = os.getenv("BSC_HTTP_RPC_URL", "")  # Ankr HTTP endpoint
+COPY_TARGET_WALLET: str = os.getenv(
+    "COPY_TARGET_WALLET",
+    "0x7e8fb0392542812476d9f2d0d71c01d1fa0776c5",
+)
+MY_BSC_PRIVATE_KEY: str = os.getenv("MY_BSC_PRIVATE_KEY", "")
+COPY_TRADE_USDT: float  = float(os.getenv("COPY_TRADE_USDT", "3"))
+COPY_SELLS: bool        = os.getenv("COPY_SELLS", "true").lower() == "true"
+COPY_TRADE_ENABLED: bool = os.getenv("COPY_TRADE_ENABLED", "true").lower() == "true"
+
 
 def validate_env() -> None:
     """Raise if any required variable is missing."""
@@ -44,4 +56,20 @@ def validate_env() -> None:
     ]
     if missing:
         raise EnvironmentError(f"Missing required env vars: {', '.join(missing)}")
+
+    # Warn (don't raise) if copy-trade vars are missing
+    copy_missing = [
+        name
+        for name, val in [
+            ("BSC_WS_RPC_URL",      BSC_WS_RPC_URL),
+            ("BSC_HTTP_RPC_URL",    BSC_HTTP_RPC_URL),
+            ("MY_BSC_PRIVATE_KEY",  MY_BSC_PRIVATE_KEY),
+        ]
+        if not val
+    ]
+    if copy_missing:
+        logger.warning(
+            "Copy-trade disabled — missing env vars: %s", ", ".join(copy_missing)
+        )
+
     logger.info("Environment validated OK")
