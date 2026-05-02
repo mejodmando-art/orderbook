@@ -282,9 +282,17 @@ class CopyTradeEngine:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.error("Mempool subscription error: %s — reconnecting in %ds",
-                             exc, WS_RECONNECT_DELAY)
-                await _fire(_notify_copy_err, f"⚠️ انقطع الاتصال بـ mempool: {exc}\nإعادة الاتصال...")
+                err_str = str(exc)
+                # 1001 = server closing normally (QuickNode keepalive reset)
+                # reconnect silently without spamming Telegram
+                is_normal_close = "1001" in err_str or "going away" in err_str.lower()
+                if is_normal_close:
+                    logger.info("WS closed normally (1001) — reconnecting silently")
+                else:
+                    logger.error("Mempool subscription error: %s — reconnecting in %ds",
+                                 exc, WS_RECONNECT_DELAY)
+                    await _fire(_notify_copy_err,
+                                f"⚠️ انقطع الاتصال بـ mempool: {exc}\nإعادة الاتصال...")
                 await asyncio.sleep(WS_RECONNECT_DELAY)
 
     async def _subscribe_mempool(self) -> None:
@@ -294,7 +302,7 @@ class CopyTradeEngine:
         ws_url = self.ws_rpc_url
         logger.info("Connecting to mempool WebSocket: %s", ws_url[:60])
 
-        async with _ws.connect(ws_url, ping_interval=20, ping_timeout=30) as ws:
+        async with _ws.connect(ws_url, ping_interval=10, ping_timeout=20, close_timeout=5) as ws:
             # Subscribe to pending transactions
             await ws.send(json.dumps({
                 "jsonrpc": "2.0",
