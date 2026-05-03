@@ -233,6 +233,9 @@ class CopyTradeEngine:
         # Seen tx hashes to avoid double-processing
         self._seen: set[str] = set()
 
+        # Last processed block number
+        self._last_block: int = 0
+
         # Token decimals cache
         self._decimals_cache: dict[str, int] = {}
 
@@ -270,7 +273,8 @@ class CopyTradeEngine:
 
     async def _init_http(self) -> None:
         """Initialise HTTP Web3 connection."""
-        self._w3h = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(self.http_rpc_url))
+        rpc = self.http_rpc_url or "https://bsc-dataseed1.binance.org/"
+        self._w3h = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(rpc))
         self._w3h.middleware_onion.inject(async_geth_poa_middleware, layer=0)
         self._router  = self._w3h.eth.contract(
             address=AsyncWeb3.to_checksum_address(PANCAKE_V2_ROUTER),
@@ -283,57 +287,69 @@ class CopyTradeEngine:
 
     async def _run_loop(self) -> None:
         await self._init_http()
-        logger.info("Starting BSCScan polling for %s", self.target_wallet)
+        # Initialise from current block so we don't replay old history
+        self._last_block = await self._w3h.eth.block_number
+        logger.info("Starting block polling for %s from block %d",
+                    self.target_wallet, self._last_block)
         await _fire(_notify_copy_err,
-                    "🔍 *نسخ التجارة يعمل*\nمراقبة المحفظة عبر BSCScan كل 3 ثوانٍ...")
+                    "🔍 *نسخ التجارة يعمل*\nمراقبة المحفظة عبر HTTP RPC كل 3 ثوانٍ...")
         while self._running:
             try:
-                await self._poll_bscscan()
+                await self._poll_new_blocks()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.error("BSCScan poll error: %s", exc)
+                logger.error("Block poll error: %s", exc)
             await asyncio.sleep(BSCSCAN_POLL_INTERVAL)
 
-    async def _poll_bscscan(self) -> None:
-        """Fetch latest transactions from BSCScan and process new ones."""
-        import aiohttp
-        params = {
-            "module":     "account",
-            "action":     "txlist",
-            "address":    self.target_wallet,
-            "startblock": 0,
-            "endblock":   99999999,
-            "page":       1,
-            "offset":     10,          # last 10 txs
-            "sort":       "desc",
-            "apikey":     self.bscscan_api_key,
-        }
-        async with aiohttp.ClientSession() as session:
-            async with session.get(BSCSCAN_API_URL, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                data = await resp.json()
-
-        if data.get("status") != "1":
+    async def _poll_new_blocks(self) -> None:
+        """Scan new blocks for PancakeSwap txs from the target wallet."""
+        latest = await self._w3h.eth.block_number
+        if latest <= self._last_block:
             return
 
-        for tx in data.get("result", []):
-            tx_hash = tx.get("hash", "")
-            if not tx_hash or tx_hash in self._seen:
+        # Process at most 5 blocks per cycle to avoid overload
+        from_block = self._last_block + 1
+        to_block   = min(latest, from_block + 4)
+
+        for block_num in range(from_block, to_block + 1):
+            try:
+                block = await self._w3h.eth.get_block(block_num, full_transactions=True)
+            except Exception as exc:
+                logger.warning("Failed to fetch block %d: %s", block_num, exc)
                 continue
-            # Only process txs to PancakeSwap V2 Router
-            if tx.get("to", "").lower() != PANCAKE_V2_ROUTER.lower():
-                self._seen.add(tx_hash)
-                continue
-            self._seen.add(tx_hash)
-            # Convert BSCScan tx format to web3-like dict
-            tx_web3 = {
-                "hash":     tx_hash,
-                "from":     tx.get("from", ""),
-                "to":       tx.get("to", ""),
-                "input":    tx.get("input", ""),
-                "gasPrice": int(tx.get("gasPrice", 5_000_000_000)),
-            }
-            asyncio.create_task(self._mirror_swap(tx_web3))
+
+            for tx in block.get("transactions", []):
+                tx_from = tx.get("from", "") or ""
+                tx_to   = (tx.get("to",   "") or "")
+                tx_hash = (tx.get("hash",  b"") or b"")
+
+                # Only care about txs FROM target wallet TO PancakeSwap router
+                if tx_from.lower() != self.target_wallet.lower():
+                    continue
+                if tx_to.lower() != PANCAKE_V2_ROUTER.lower():
+                    continue
+
+                hash_hex = tx_hash.hex() if isinstance(tx_hash, bytes) else str(tx_hash)
+                if hash_hex in self._seen:
+                    continue
+                self._seen.add(hash_hex)
+
+                input_data = tx.get("input", b"")
+                if isinstance(input_data, bytes):
+                    input_data = "0x" + input_data.hex()
+
+                tx_web3 = {
+                    "hash":     hash_hex,
+                    "from":     tx_from,
+                    "to":       tx_to,
+                    "input":    input_data,
+                    "gasPrice": tx.get("gasPrice", 5_000_000_000),
+                }
+                logger.info("Found target swap in block %d: %s", block_num, hash_hex[:20])
+                asyncio.create_task(self._mirror_swap(tx_web3))
+
+        self._last_block = to_block
 
         # Trim seen set
         if len(self._seen) > 10_000:

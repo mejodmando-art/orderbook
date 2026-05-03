@@ -31,7 +31,7 @@ FILL_POLL_INTERVAL: int = 10        # seconds between fill-check cycles
 
 # ── Copy-trade (BSC / PancakeSwap V2) ─────────────────────────────────────────
 BSC_WS_RPC_URL: str   = os.getenv("BSC_WS_RPC_URL", "")    # Ankr WebSocket endpoint
-BSC_HTTP_RPC_URL: str = os.getenv("BSC_HTTP_RPC_URL", "")  # Ankr HTTP endpoint
+BSC_HTTP_RPC_URL: str = os.getenv("BSC_HTTP_RPC_URL", "https://bsc-dataseed1.binance.org/")  # BSC HTTP RPC
 COPY_TARGET_WALLET: str = os.getenv(
     "COPY_TARGET_WALLET",
     "0x7e8fb0392542812476d9f2d0d71c01d1fa0776c5",
@@ -60,19 +60,9 @@ def validate_env() -> None:
 
     # Warn (don't raise) if required copy-trade vars are missing
     # BSC_WS_RPC_URL is optional — engine uses BSCScan HTTP polling when absent
-    copy_missing = [
-        name
-        for name, val in [
-            ("BSC_HTTP_RPC_URL",   BSC_HTTP_RPC_URL),
-            ("MY_BSC_PRIVATE_KEY", MY_BSC_PRIVATE_KEY),
-        ]
-        if not val
-    ]
-    if copy_missing:
-        logger.warning(
-            "Copy-trade disabled — missing env vars: %s", ", ".join(copy_missing)
-        )
-    elif not BSC_WS_RPC_URL:
-        logger.info("Copy-trade: WSS not set — using BSCScan HTTP polling mode")
+    if not MY_BSC_PRIVATE_KEY:
+        logger.warning("Copy-trade disabled — missing env var: MY_BSC_PRIVATE_KEY")
+    else:
+        logger.info("Copy-trade: using RPC %s", BSC_HTTP_RPC_URL)
 
     logger.info("Environment validated OK")

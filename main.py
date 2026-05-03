@@ -149,9 +149,7 @@ def main() -> None:
 
     # Wire copy-trade engine if all required vars are present
     # BSC_WS_RPC_URL is optional — engine falls back to BSCScan HTTP polling
-    logger.info("BSC_HTTP_RPC_URL set: %s | MY_BSC_PRIVATE_KEY set: %s",
-                bool(BSC_HTTP_RPC_URL), bool(MY_BSC_PRIVATE_KEY))
-    if BSC_HTTP_RPC_URL and MY_BSC_PRIVATE_KEY:
+    if MY_BSC_PRIVATE_KEY:
         from core.copy_trade_engine import CopyTradeEngine, set_copy_notifiers
         from bot.copy_bot import (
             register_copy_handlers, set_copy_engine,
