@@ -753,7 +753,6 @@ def register_menu_handlers(app: Application) -> None:
         pattern=r"^adjinv_show:",
     ))
     app.add_handler(CallbackQueryHandler(_cb_help, pattern=r"^help:"))
-    # group=1 gives copy_bot's handlers (group=0) priority when BSC is configured
-    app.add_handler(CallbackQueryHandler(_cb_copy_fallback, pattern=r"^copy_"), group=1)
+    app.add_handler(CallbackQueryHandler(_cb_copy_fallback, pattern=r"^copy_"))
 
     logger.info("Grid + Help menu handlers registered")

@@ -227,11 +227,13 @@ def register_copy_handlers(application) -> None:
     application.add_handler(CommandHandler("copy_start",   cmd_copy_start))
     application.add_handler(CommandHandler("copy_stop",    cmd_copy_stop))
     application.add_handler(CommandHandler("copy_history", cmd_copy_history))
+    # group=-1 ensures these handlers run before menu_bot's fallback (group=0)
     application.add_handler(
         CallbackQueryHandler(
             copy_callback,
             pattern=r"^copy_(status_cb|pause|resume|history_cb)$",
-        )
+        ),
+        group=-1,
     )
     logger.info("Copy-trade handlers registered")
 
