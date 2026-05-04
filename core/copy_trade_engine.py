@@ -360,12 +360,9 @@ class CopyTradeEngine:
 
         logger.info("Connecting to mempool WebSocket: %s", self.ws_rpc_url[:60])
 
-        # websockets >=11 uses websockets.connect() as async context manager
-        ws_connect = getattr(_ws, "connect", None) or getattr(_ws, "client", _ws).connect
-
-        async with ws_connect(
+        async with _ws.connect(
             self.ws_rpc_url,
-            ping_interval=None,   # disable auto-ping — NodeReal rejects it
+            ping_interval=None,
             ping_timeout=None,
         ) as ws:
             # Subscribe to new pending transactions
