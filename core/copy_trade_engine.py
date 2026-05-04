@@ -360,12 +360,10 @@ class CopyTradeEngine:
 
         logger.info("Connecting to mempool WebSocket: %s", self.ws_rpc_url[:60])
 
-        async with _ws.connect(
-            self.ws_rpc_url,
-            ping_interval=20,
-            ping_timeout=30,
-            close_timeout=5,
-        ) as ws:
+        # websockets >=11 uses websockets.connect() as async context manager
+        ws_connect = getattr(_ws, "connect", None) or getattr(_ws, "client", _ws).connect
+
+        async with ws_connect(self.ws_rpc_url) as ws:
             # Subscribe to new pending transactions
             await ws.send(json.dumps({
                 "jsonrpc": "2.0",
@@ -377,25 +375,30 @@ class CopyTradeEngine:
             resp = json.loads(await ws.recv())
             sub_id = resp.get("result")
             if not sub_id:
-                raise RuntimeError(f"Subscription failed: {resp}")
+                raise RuntimeError(f"eth_subscribe failed: {resp}")
             logger.info("Mempool subscription active: %s", sub_id)
 
-            async for raw in ws:
-                if not self._running:
-                    break
+            while self._running:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                except asyncio.TimeoutError:
+                    # Send ping to keep connection alive
+                    await ws.ping()
+                    continue
+
                 try:
                     msg = json.loads(raw)
-                    tx_hash = (
-                        msg.get("params", {})
-                           .get("result")
-                    )
+                    tx_hash = msg.get("params", {}).get("result")
                     if not tx_hash or not isinstance(tx_hash, str):
                         continue
                     if tx_hash in self._seen:
                         continue
 
                     # Fetch full tx to check sender
-                    tx = await self._w3h.eth.get_transaction(tx_hash)
+                    try:
+                        tx = await self._w3h.eth.get_transaction(tx_hash)
+                    except Exception:
+                        continue
                     if tx is None:
                         continue
 
