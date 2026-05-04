@@ -320,20 +320,119 @@ class CopyTradeEngine:
 
     async def _run_loop(self) -> None:
         await self._init_http()
-        # Initialise from current block so we don't replay old history
         self._last_block = await self._w3h.eth.block_number
-        logger.info("Starting block polling for %s from block %d",
-                    self.target_wallet, self._last_block)
-        await _fire(_notify_copy_err,
-                    "🔍 *نسخ التجارة يعمل*\nمراقبة المحفظة عبر HTTP RPC كل 3 ثوانٍ...")
-        while self._running:
-            try:
-                await self._poll_new_blocks()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.error("Block poll error: %s", exc)
-            await asyncio.sleep(BSCSCAN_POLL_INTERVAL)
+
+        if self.ws_rpc_url:
+            logger.info("WebSocket RPC detected — using mempool mode")
+            await _fire(_notify_copy_err,
+                        "🔍 *نسخ التجارة يعمل*\n⚡ وضع الـ Mempool (WebSocket) — أسرع من الـ blocks")
+            while self._running:
+                try:
+                    await self._subscribe_mempool()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    err = str(exc)
+                    is_normal = "1001" in err or "going away" in err.lower()
+                    if is_normal:
+                        logger.info("WS closed normally — reconnecting")
+                    else:
+                        logger.error("WS error: %s — reconnecting in %ds", exc, WS_RECONNECT_DELAY)
+                        await _fire(_notify_copy_err,
+                                    f"⚠️ انقطع الـ WebSocket: `{exc}`\nإعادة الاتصال...")
+                    await asyncio.sleep(WS_RECONNECT_DELAY)
+        else:
+            logger.info("No WSS URL — using block polling every %ds", BSCSCAN_POLL_INTERVAL)
+            await _fire(_notify_copy_err,
+                        "🔍 *نسخ التجارة يعمل*\n🕐 وضع الـ Block Polling كل 3 ثوانٍ")
+            while self._running:
+                try:
+                    await self._poll_new_blocks()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.error("Block poll error: %s", exc)
+                await asyncio.sleep(BSCSCAN_POLL_INTERVAL)
+
+    async def _subscribe_mempool(self) -> None:
+        """Subscribe to pending transactions via WebSocket and mirror target wallet swaps."""
+        import websockets as _ws
+
+        logger.info("Connecting to mempool WebSocket: %s", self.ws_rpc_url[:60])
+
+        async with _ws.connect(
+            self.ws_rpc_url,
+            ping_interval=20,
+            ping_timeout=30,
+            close_timeout=5,
+        ) as ws:
+            # Subscribe to new pending transactions
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_subscribe",
+                "params": ["newPendingTransactions"],
+            }))
+
+            resp = json.loads(await ws.recv())
+            sub_id = resp.get("result")
+            if not sub_id:
+                raise RuntimeError(f"Subscription failed: {resp}")
+            logger.info("Mempool subscription active: %s", sub_id)
+
+            async for raw in ws:
+                if not self._running:
+                    break
+                try:
+                    msg = json.loads(raw)
+                    tx_hash = (
+                        msg.get("params", {})
+                           .get("result")
+                    )
+                    if not tx_hash or not isinstance(tx_hash, str):
+                        continue
+                    if tx_hash in self._seen:
+                        continue
+
+                    # Fetch full tx to check sender
+                    tx = await self._w3h.eth.get_transaction(tx_hash)
+                    if tx is None:
+                        continue
+
+                    tx_from = (tx.get("from") or "").lower()
+                    tx_to   = (tx.get("to")   or "").lower()
+
+                    if tx_from != self.target_wallet.lower():
+                        continue
+                    if not tx_to:
+                        continue
+
+                    self._seen.add(tx_hash)
+
+                    input_data = tx.get("input", b"")
+                    if isinstance(input_data, bytes):
+                        input_data = "0x" + input_data.hex()
+
+                    tx_web3 = {
+                        "hash":     tx_hash,
+                        "from":     tx.get("from", ""),
+                        "to":       tx.get("to", ""),
+                        "input":    input_data,
+                        "value":    tx.get("value", 0),
+                        "gasPrice": tx.get("gasPrice", 5_000_000_000),
+                    }
+                    logger.info("Mempool: target tx %s → %s", tx_hash[:20], tx_to[:10])
+                    if self.enabled:
+                        asyncio.create_task(self._mirror_swap(tx_web3))
+
+                    # Trim seen set
+                    if len(self._seen) > 10_000:
+                        self._seen = set(list(self._seen)[-5_000:])
+
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("Mempool msg error: %s", exc)
 
     async def _poll_new_blocks(self) -> None:
         """Scan new blocks for any transaction sent FROM the target wallet."""
@@ -762,33 +861,14 @@ class CopyTradeEngine:
             bnb_balance  = balance / 10**18
             required_bnb = required_wei / 10**18
 
-            # Build watch-mode block only when we have a token address
-            watch_block = ""
-            if token_out:
-                target_entry: Optional[float] = None
-                if original_tx_hash:
-                    try:
-                        target_entry = await self._get_target_entry_price(
-                            original_tx_hash, token_out, self.target_wallet
-                        )
-                    except Exception:
-                        pass
-                price_line = f"\n🎯 سعر دخوله: `${target_entry:.8f}`" if target_entry else ""
-                watch_block = (
-                    f"\n━━━━━━━━━━━━━━━━━━━━\n"
-                    f"👁 *مراقبة فقط — لم يُنفَّذ*\n"
-                    f"🪙 العقد: `{token_out}`{price_line}\n"
-                    f"[📈 GMGN](https://gmgn.ai/bsc/token/{token_out})"
-                )
-
-            await _fire(
-                _notify_copy_err,
-                f"⚠️ *رصيد غير كافٍ — صفقة فاتت*\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"الرصيد الحالي: `{bnb_balance:.4f} BNB`\n"
-                f"المطلوب: `{required_bnb:.4f} BNB` (~${float(self.trade_usdt):.2f} USDT)\n"
-                f"احتياطي الـ gas: `0.005 BNB`"
-                f"{watch_block}",
+            await self._notify_insufficient_balance(
+                token_out=token_out,
+                original_tx_hash=original_tx_hash,
+                balance_line=(
+                    f"الرصيد الحالي: `{bnb_balance:.4f} BNB`\n"
+                    f"المطلوب: `{required_bnb:.4f} BNB` (~${float(self.trade_usdt):.2f} USDT)\n"
+                    f"احتياطي الـ gas: `0.005 BNB`"
+                ),
             )
             logger.warning(
                 "Insufficient BNB: have %.4f, need %.4f",
@@ -796,6 +876,38 @@ class CopyTradeEngine:
             )
             return False
         return True
+
+    async def _notify_insufficient_balance(
+        self,
+        token_out: str,
+        original_tx_hash: str,
+        balance_line: str,
+    ) -> None:
+        """Send insufficient-balance alert with watch-mode token info."""
+        watch_block = ""
+        if token_out:
+            tgt: Optional[float] = None
+            if original_tx_hash:
+                try:
+                    tgt = await self._get_target_entry_price(
+                        original_tx_hash, token_out, self.target_wallet
+                    )
+                except Exception:
+                    pass
+            price_line = f"\n🎯 سعر دخوله: `${tgt:.8f}`" if tgt else ""
+            watch_block = (
+                f"\n━━━━━━━━━━━━━━━━━━━━\n"
+                f"👁 *مراقبة فقط — لم يُنفَّذ*\n"
+                f"🪙 العقد: `{token_out}`{price_line}\n"
+                f"[📈 GMGN](https://gmgn.ai/bsc/token/{token_out})"
+            )
+        await _fire(
+            _notify_copy_err,
+            f"⚠️ *رصيد غير كافٍ — صفقة فاتت*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{balance_line}"
+            f"{watch_block}",
+        )
 
     async def _execute_buy(self, path: list[str], original_tx: dict) -> None:
         """
@@ -856,28 +968,10 @@ class CopyTradeEngine:
             )
             balance = await stable_contract.functions.balanceOf(self.my_address).call()
             if balance < amount_in_wei:
-                target_entry: Optional[float] = None
-                original_hash = original_tx.get("hash", "")
-                if original_hash:
-                    try:
-                        target_entry = await self._get_target_entry_price(
-                            original_hash, path[-1], self.target_wallet
-                        )
-                    except Exception:
-                        pass
-                price_line   = f"\n🎯 سعر دخوله: `${target_entry:.8f}`" if target_entry else ""
-                watch_block  = (
-                    f"\n━━━━━━━━━━━━━━━━━━━━\n"
-                    f"👁 *مراقبة فقط — لم يُنفَّذ*\n"
-                    f"🪙 العقد: `{path[-1]}`{price_line}\n"
-                    f"[📈 GMGN](https://gmgn.ai/bsc/token/{path[-1]})"
-                )
-                await _fire(
-                    _notify_copy_err,
-                    f"⚠️ *رصيد غير كافٍ — صفقة فاتت*\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"الرصيد الحالي: `{balance / 10**decimals:.2f}` | المطلوب: `{float(self.trade_usdt):.2f}` USDT"
-                    f"{watch_block}",
+                await self._notify_insufficient_balance(
+                    token_out=path[-1],
+                    original_tx_hash=original_tx.get("hash", ""),
+                    balance_line=f"الرصيد الحالي: `{balance / 10**decimals:.2f}` | المطلوب: `{float(self.trade_usdt):.2f}` USDT",
                 )
                 logger.warning("Insufficient stable balance: have %s, need %s", balance, amount_in_wei)
                 return
@@ -922,32 +1016,7 @@ class CopyTradeEngine:
         logger.info("✅ BUY sent: %s | amount_in=%s | token_out=%s",
                     tx_hash_hex, amount_in_wei, path[-1])
 
-        # Wait for confirmation then calculate entry prices
-        my_entry:     Optional[float] = None
-        target_entry: Optional[float] = None
-        try:
-            await self._w3h.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
-            my_entry = await self._get_entry_price_from_receipt(
-                tx_hash_hex, path[-1], float(self.trade_usdt)
-            )
-            original_hash = original_tx.get("hash", "")
-            if original_hash:
-                target_entry = await self._get_target_entry_price(
-                    original_hash, path[-1], self.target_wallet
-                )
-        except Exception as exc:
-            logger.warning("Could not calculate entry prices: %s", exc)
-
-        await _fire(
-            _notify_copy_buy,
-            path[-1],           # full token contract address
-            float(self.trade_usdt),
-            tx_hash_hex,
-            my_entry,
-            target_entry,
-        )
-
-        # Persist to DB
+        # Persist immediately — don't wait for confirmation
         await self._record_copy_trade(
             side="buy",
             token_in=path[0],
@@ -955,6 +1024,47 @@ class CopyTradeEngine:
             amount_in_usdt=float(self.trade_usdt),
             tx_hash=tx_hash_hex,
             original_tx=original_tx.get("hash", ""),
+        )
+
+        # Confirm + calculate prices + notify in background (non-blocking)
+        asyncio.create_task(self._confirm_and_notify_buy(
+            tx_hash=tx_hash,
+            tx_hash_hex=tx_hash_hex,
+            token_out=path[-1],
+            trade_usdt=float(self.trade_usdt),
+            original_tx_hash=original_tx.get("hash", ""),
+        ))
+
+    async def _confirm_and_notify_buy(
+        self,
+        tx_hash: bytes,
+        tx_hash_hex: str,
+        token_out: str,
+        trade_usdt: float,
+        original_tx_hash: str,
+    ) -> None:
+        """Wait for BUY confirmation then send enriched notification. Non-blocking."""
+        my_entry:     Optional[float] = None
+        target_entry: Optional[float] = None
+        try:
+            await self._w3h.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+            my_entry = await self._get_entry_price_from_receipt(
+                tx_hash_hex, token_out, trade_usdt
+            )
+            if original_tx_hash:
+                target_entry = await self._get_target_entry_price(
+                    original_tx_hash, token_out, self.target_wallet
+                )
+        except Exception as exc:
+            logger.warning("Could not calculate entry prices: %s", exc)
+
+        await _fire(
+            _notify_copy_buy,
+            token_out,
+            trade_usdt,
+            tx_hash_hex,
+            my_entry,
+            target_entry,
         )
 
     async def _execute_sell(self, path: list[str], original_tx: dict) -> None:
@@ -1048,8 +1158,8 @@ class CopyTradeEngine:
         signed = self.account.sign_transaction(tx)
         tx_hash = await self._w3h.eth.send_raw_transaction(signed.raw_transaction)
         logger.info("Approve sent: %s for token %s", tx_hash.hex(), token_address[:10])
-        # Wait for approval to be mined
-        await self._w3h.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
+        # Must wait — swap will fail if approval isn't confirmed first
+        await self._w3h.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
 
     async def _record_copy_trade(
         self,
